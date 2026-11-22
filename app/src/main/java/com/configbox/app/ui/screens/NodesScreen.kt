@@ -16,11 +16,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.DragIndicator
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
@@ -59,6 +61,9 @@ import com.configbox.app.model.NodeSource
 import com.configbox.app.model.ProxyNode
 import com.configbox.app.ui.ConfigBoxUiState
 import com.configbox.app.ui.ConfigBoxViewModel
+import com.configbox.app.ui.components.draggedItemVisual
+import com.configbox.app.ui.components.longPressReorderContainer
+import com.configbox.app.ui.components.rememberDragReorderState
 import com.configbox.app.ui.theme.AmberBadge
 import com.configbox.app.ui.theme.BorderGray
 import com.configbox.app.ui.theme.EmeraldActive
@@ -158,14 +163,37 @@ fun NodesScreen(
                     }
                 }
 
+                val canDragReorder = searchQuery.isBlank() && selectedFilter == "全部"
+                val nodeListState = rememberLazyListState()
+                val nodeReorderState = rememberDragReorderState(listState = nodeListState, headerCount = 1)
+
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
+                    state = nodeListState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .longPressReorderContainer(
+                            reorderState = nodeReorderState,
+                            enabled = canDragReorder,
+                            itemCount = filteredNodes.size,
+                            onSwap = { from, to -> viewModel.swapNodesInMemory(from, to) },
+                            onDragFinished = { viewModel.persistCurrentOrder() }
+                        ),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 84.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(filteredNodes, key = { it.id }) { node ->
+                    item(key = "nodes_hint") {
+                        Text(
+                            text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑" else "清除搜索和筛选后可长按拖动排序",
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                    itemsIndexed(filteredNodes, key = { _, node -> node.id }) { idx, node ->
+                        val isDragging = nodeReorderState.draggedDataIndex == idx
                         NodeCard(
                             node = node,
+                            isDragging = isDragging,
+                            modifier = Modifier.draggedItemVisual(isDragging, nodeReorderState.dragOffsetY),
+                            showDragHandle = canDragReorder,
                             onClick = { editingNode = node },
                             onDelete = { viewModel.deleteNode(node.id) }
                         )
@@ -214,7 +242,7 @@ fun NodesScreen(
                             }
                         }
                     } else {
-                        items(relayedNodes, key = { it.id }) { node ->
+                        itemsIndexed(relayedNodes, key = { _, it -> it.id }) { _, node ->
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = CardDefaults.cardColors(containerColor = PureWhite),
@@ -401,23 +429,35 @@ private fun BindRelayDialog(
 @Composable
 private fun NodeCard(
     node: ProxyNode,
+    isDragging: Boolean,
+    showDragHandle: Boolean,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable { onClick() },
         colors = CardDefaults.cardColors(containerColor = PureWhite),
-        border = BorderStroke(1.dp, BorderGray),
+        border = BorderStroke(if (isDragging) 1.5.dp else 1.dp, if (isDragging) SkyAccent else BorderGray),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(horizontal = 12.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            if (showDragHandle) {
+                Icon(
+                    imageVector = Icons.Outlined.DragIndicator,
+                    contentDescription = "长按拖动",
+                    tint = SlateMuted,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+            }
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -446,8 +486,8 @@ private fun NodeCard(
                     BadgeTag("dialer-proxy: ${node.dialerProxy}", AmberBadge)
                 }
             }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除节点", tint = RoseDanger)
+            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除节点", tint = RoseDanger, modifier = Modifier.size(18.dp))
             }
         }
     }

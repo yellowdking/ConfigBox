@@ -255,14 +255,35 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         newDialerProxy: String?
     ) {
         val profile = _uiState.value.activeProfile ?: return
-        val updatedList = profile.proxies.map { node ->
+        val oldNode = profile.proxies.firstOrNull { it.id == nodeId } ?: return
+        val cleanNewName = newName.trim().ifBlank { oldNode.name }
+        val renamed = oldNode.name != cleanNewName
+
+        var updatedProxies = profile.proxies.map { node ->
             if (node.id == nodeId) {
-                ConfigEngine.updateNodeBasicFields(node, newName, newServer, newPort, newUdp, newDialerProxy)
+                ConfigEngine.updateNodeBasicFields(node, cleanNewName, newServer, newPort, newUdp, newDialerProxy)
             } else {
                 node
             }
         }
-        mutateActiveProfile(profile.copy(proxies = updatedList), "节点已更新")
+
+        // Cascade rename to other nodes' dialer-proxy and all proxyGroups
+        var updatedGroups = profile.proxyGroups
+        if (renamed) {
+            updatedProxies = updatedProxies.map { n ->
+                if (n.dialerProxy == oldNode.name) {
+                    ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, cleanNewName)
+                } else {
+                    n
+                }
+            }
+            updatedGroups = replaceMemberInGroups(updatedGroups, oldNode.name, cleanNewName)
+        }
+
+        mutateActiveProfile(
+            profile.copy(proxies = updatedProxies, proxyGroups = updatedGroups),
+            "节点已更新"
+        )
     }
 
     fun updateNodeRawYaml(nodeId: String, newRawYaml: String) {
@@ -270,11 +291,63 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         val existing = profile.proxies.firstOrNull { it.id == nodeId } ?: return
         runCatching {
             val parsed = ConfigEngine.parseNodeFromYaml(newRawYaml, existing.source).copy(id = nodeId)
-            val updatedList = profile.proxies.map { if (it.id == nodeId) parsed else it }
-            mutateActiveProfile(profile.copy(proxies = updatedList), "节点 YAML 已保存")
+            var updatedProxies = profile.proxies.map { if (it.id == nodeId) parsed else it }
+            var updatedGroups = profile.proxyGroups
+            if (existing.name != parsed.name) {
+                updatedProxies = updatedProxies.map { n ->
+                    if (n.dialerProxy == existing.name) {
+                        ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, parsed.name)
+                    } else {
+                        n
+                    }
+                }
+                updatedGroups = replaceMemberInGroups(updatedGroups, existing.name, parsed.name)
+            }
+            mutateActiveProfile(
+                profile.copy(proxies = updatedProxies, proxyGroups = updatedGroups),
+                "节点 YAML 已保存"
+            )
         }.onFailure { err ->
             postMessage("YAML 格式有误：${err.message}")
         }
+    }
+
+    fun swapNodesInMemory(fromIndex: Int, toIndex: Int) {
+        _uiState.update { state ->
+            val profile = state.activeProfile ?: return@update state
+            if (fromIndex !in profile.proxies.indices || toIndex !in profile.proxies.indices) return@update state
+            val list = profile.proxies.toMutableList()
+            val item = list.removeAt(fromIndex)
+            list.add(toIndex, item)
+            state.copy(activeProfile = profile.copy(proxies = list))
+        }
+    }
+
+    fun swapProxyGroupsInMemory(fromIndex: Int, toIndex: Int) {
+        _uiState.update { state ->
+            val profile = state.activeProfile ?: return@update state
+            if (fromIndex !in profile.proxyGroups.indices || toIndex !in profile.proxyGroups.indices) return@update state
+            val list = profile.proxyGroups.toMutableList()
+            val item = list.removeAt(fromIndex)
+            list.add(toIndex, item)
+            state.copy(activeProfile = profile.copy(proxyGroups = list))
+        }
+    }
+
+    fun persistCurrentOrder() {
+        val profile = _uiState.value.activeProfile ?: return
+        mutateActiveProfile(profile, null)
+    }
+
+    fun moveNode(nodeId: String, delta: Int) {
+        val profile = _uiState.value.activeProfile ?: return
+        val list = profile.proxies.toMutableList()
+        val idx = list.indexOfFirst { it.id == nodeId }
+        val targetIdx = idx + delta
+        if (idx < 0 || targetIdx !in list.indices) return
+        val item = list.removeAt(idx)
+        list.add(targetIdx, item)
+        mutateActiveProfile(profile.copy(proxies = list), null)
     }
 
     fun bindRelayToNodes(exitNodeIds: Set<String>, entryProxy: String) {
@@ -293,11 +366,25 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         mutateActiveProfile(profile.copy(proxies = updatedNodes), "已取消该节点的 dialer-proxy 中转")
     }
 
+    /**
+     * Deletes a node AND immediately prunes it from all proxy-groups and any dialer-proxy references.
+     */
     fun deleteNode(nodeId: String) {
         val profile = _uiState.value.activeProfile ?: return
+        val target = profile.proxies.firstOrNull { it.id == nodeId } ?: return
+        val remainingProxies = profile.proxies
+            .filterNot { it.id == nodeId }
+            .map { n ->
+                if (n.dialerProxy == target.name) {
+                    ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, null)
+                } else {
+                    n
+                }
+            }
+        val cleanedGroups = removeMemberFromGroups(profile.proxyGroups, target.name)
         mutateActiveProfile(
-            profile.copy(proxies = profile.proxies.filterNot { it.id == nodeId }),
-            "已删除节点"
+            profile.copy(proxies = remainingProxies, proxyGroups = cleanedGroups),
+            "已删除节点「${target.name}」并同步清理策略组引用"
         )
     }
 
@@ -312,19 +399,38 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         interval: Int?
     ) {
         val profile = _uiState.value.activeProfile ?: return
+        val oldGroup = existingId?.let { id -> profile.proxyGroups.firstOrNull { it.id == id } }
         val built = if (existingId != null) {
             ConfigEngine.buildProxyGroup(existingId, name, type, proxies, url, interval)
         } else {
             ConfigEngine.buildProxyGroup(name = name, type = type, proxies = proxies, url = url, interval = interval)
         }
-        val exists = existingId != null && profile.proxyGroups.any { it.id == existingId }
-        val updatedGroups = if (exists) {
+        val exists = oldGroup != null
+        var updatedGroups = if (exists) {
             profile.proxyGroups.map { if (it.id == existingId) built else it }
         } else {
             listOf(built) + profile.proxyGroups
         }
+
+        // If renamed, cascade to other groups, rules, and node dialer-proxy
+        var updatedProxies = profile.proxies
+        var updatedRules = profile.rules
+        if (oldGroup != null && oldGroup.name != built.name) {
+            updatedGroups = replaceMemberInGroups(updatedGroups, oldGroup.name, built.name)
+            updatedProxies = updatedProxies.map { n ->
+                if (n.dialerProxy == oldGroup.name) {
+                    ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, built.name)
+                } else {
+                    n
+                }
+            }
+            updatedRules = updatedRules.map { r ->
+                if (r.target == oldGroup.name) r.copy(target = built.name) else r
+            }
+        }
+
         mutateActiveProfile(
-            profile.copy(proxyGroups = updatedGroups),
+            profile.copy(proxies = updatedProxies, proxyGroups = updatedGroups, rules = updatedRules),
             if (exists) "策略组已更新" else "已新建策略组：${built.name}"
         )
     }
@@ -342,9 +448,21 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteProxyGroup(groupId: String) {
         val profile = _uiState.value.activeProfile ?: return
+        val target = profile.proxyGroups.firstOrNull { it.id == groupId } ?: return
+        val remainingGroups = removeMemberFromGroups(
+            profile.proxyGroups.filterNot { it.id == groupId },
+            target.name
+        )
+        val updatedProxies = profile.proxies.map { n ->
+            if (n.dialerProxy == target.name) {
+                ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, null)
+            } else {
+                n
+            }
+        }
         mutateActiveProfile(
-            profile.copy(proxyGroups = profile.proxyGroups.filterNot { it.id == groupId }),
-            "已删除策略组"
+            profile.copy(proxies = updatedProxies, proxyGroups = remainingGroups),
+            "已删除策略组「${target.name}」"
         )
     }
 
@@ -409,6 +527,49 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun getLocalSubUrl(): String? {
         val id = _uiState.value.activeProfile?.meta?.id ?: return null
         return localServer.subscriptionUrl(id)
+    }
+
+    private fun removeMemberFromGroups(
+        groups: List<ProxyGroupEntry>,
+        removedName: String
+    ): List<ProxyGroupEntry> {
+        return groups.map { group ->
+            if (removedName in group.proxies) {
+                val pruned = group.proxies.filterNot { it == removedName }.ifEmpty { listOf("DIRECT") }
+                ConfigEngine.buildProxyGroup(
+                    id = group.id,
+                    name = group.name,
+                    type = group.type,
+                    proxies = pruned,
+                    url = group.url,
+                    interval = group.interval
+                )
+            } else {
+                group
+            }
+        }
+    }
+
+    private fun replaceMemberInGroups(
+        groups: List<ProxyGroupEntry>,
+        oldName: String,
+        newName: String
+    ): List<ProxyGroupEntry> {
+        return groups.map { group ->
+            if (oldName in group.proxies) {
+                val replaced = group.proxies.map { if (it == oldName) newName else it }.distinct()
+                ConfigEngine.buildProxyGroup(
+                    id = group.id,
+                    name = group.name,
+                    type = group.type,
+                    proxies = replaced,
+                    url = group.url,
+                    interval = group.interval
+                )
+            } else {
+                group
+            }
+        }
     }
 
     private fun mutateActiveProfile(updated: SplitProfile, successMsg: String?) {

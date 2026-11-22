@@ -16,7 +16,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.DragIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -54,6 +56,9 @@ import androidx.compose.ui.unit.sp
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.ui.ConfigBoxUiState
 import com.configbox.app.ui.ConfigBoxViewModel
+import com.configbox.app.ui.components.draggedItemVisual
+import com.configbox.app.ui.components.longPressReorderContainer
+import com.configbox.app.ui.components.rememberDragReorderState
 import com.configbox.app.ui.theme.BorderGray
 import com.configbox.app.ui.theme.EmeraldActive
 import com.configbox.app.ui.theme.PureWhite
@@ -94,28 +99,41 @@ fun GroupsScreen(
         active.proxies.filter { !it.dialerProxy.isNullOrBlank() }.map { it.name }.toSet()
     }
 
+    val groupListState = rememberLazyListState()
+    val groupReorderState = rememberDragReorderState(listState = groupListState, headerCount = 1)
+
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            state = groupListState,
+            modifier = Modifier
+                .fillMaxSize()
+                .longPressReorderContainer(
+                    reorderState = groupReorderState,
+                    enabled = true,
+                    itemCount = active.proxyGroups.size,
+                    onSwap = { from, to -> viewModel.swapProxyGroupsInMemory(from, to) },
+                    onDragFinished = { viewModel.persistCurrentOrder() }
+                ),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            item {
+            item(key = "groups_hint") {
                 Text(
-                    text = "共 ${active.proxyGroups.size} 个策略组（支持手动新建中转策略组、选 Emoji 与增删成员）",
+                    text = "共 ${active.proxyGroups.size} 个策略组 · 长按卡片上下拖动排序 · 点击编辑",
                     style = MaterialTheme.typography.labelMedium
                 )
             }
 
-            items(active.proxyGroups, key = { it.id }) { group ->
+            itemsIndexed(active.proxyGroups, key = { _, it -> it.id }) { idx, group ->
+                val isDragging = groupReorderState.draggedDataIndex == idx
                 GroupCard(
                     group = group,
+                    isDragging = isDragging,
+                    modifier = Modifier.draggedItemVisual(isDragging, groupReorderState.dragOffsetY),
                     onClick = {
                         isNewGroup = false
                         editingGroup = group
                     },
-                    onMoveUp = { viewModel.moveProxyGroup(group.id, -1) },
-                    onMoveDown = { viewModel.moveProxyGroup(group.id, 1) },
                     onDelete = { viewModel.deleteProxyGroup(group.id) }
                 )
             }
@@ -169,70 +187,73 @@ fun GroupsScreen(
 @Composable
 private fun GroupCard(
     group: ProxyGroupEntry,
+    isDragging: Boolean,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable { onClick() },
         colors = CardDefaults.cardColors(containerColor = PureWhite),
-        border = BorderStroke(1.dp, BorderGray),
+        border = BorderStroke(if (isDragging) 1.5.dp else 1.dp, if (isDragging) SkyAccent else BorderGray),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = group.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Surface(
-                    color = SkyAccent.copy(alpha = 0.1f),
-                    shape = MaterialTheme.shapes.extraSmall
-                ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.DragIndicator,
+                contentDescription = "长按拖动",
+                tint = SlateMuted,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = group.type,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        text = group.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Surface(
+                        color = SkyAccent.copy(alpha = 0.1f),
+                        shape = MaterialTheme.shapes.extraSmall
+                    ) {
+                        Text(
+                            text = group.type,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SkyAccent
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "${group.proxies.size} 项",
                         fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = SkyAccent
+                        fontSize = 11.sp,
+                        color = SlateMuted
                     )
                 }
-                Spacer(Modifier.width(6.dp))
+                Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "${group.proxies.size} 项",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    color = SlateMuted
+                    text = group.proxies.take(6).joinToString(" · ") + if (group.proxies.size > 6) " …" else "",
+                    fontSize = 12.sp,
+                    color = SlateMuted,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = group.proxies.take(6).joinToString(" · ") + if (group.proxies.size > 6) " …" else "",
-                fontSize = 12.sp,
-                color = SlateMuted,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                IconButton(onClick = onMoveUp, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Outlined.ArrowUpward, contentDescription = "上移", modifier = Modifier.size(16.dp))
-                }
-                IconButton(onClick = onMoveDown, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Outlined.ArrowDownward, contentDescription = "下移", modifier = Modifier.size(16.dp))
-                }
-                IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除策略组", tint = RoseDanger, modifier = Modifier.size(16.dp))
-                }
+            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除策略组", tint = RoseDanger, modifier = Modifier.size(18.dp))
             }
         }
     }
@@ -250,14 +271,16 @@ private fun GroupEditDialog(
 ) {
     var name by remember { mutableStateOf(initial.name) }
     var type by remember { mutableStateOf(initial.type) }
-    var selectedMembers by remember { mutableStateOf(initial.proxies) }
-    var testUrl by remember { mutableStateOf(initial.url ?: "https://www.gstatic.com/generate_204") }
-    var intervalText by remember { mutableStateOf((initial.interval ?: 300).toString()) }
-    var emojiCatIdx by remember { mutableIntStateOf(0) }
-
     val memberCandidates = remember(otherGroupNames, allNodeNames) {
         otherGroupNames + allNodeNames + listOf("DIRECT", "REJECT")
     }
+    val validCandidateSet = remember(memberCandidates) { memberCandidates.toSet() }
+    var selectedMembers by remember(initial.id, memberCandidates) {
+        mutableStateOf(initial.proxies.filter { it in validCandidateSet })
+    }
+    var testUrl by remember { mutableStateOf(initial.url ?: "https://www.gstatic.com/generate_204") }
+    var intervalText by remember { mutableStateOf((initial.interval ?: 300).toString()) }
+    var emojiCatIdx by remember { mutableIntStateOf(0) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -350,7 +373,67 @@ private fun GroupEditDialog(
                     )
                 }
 
-                Text("包含成员（已选 ${selectedMembers.size} 项，带 ⛓ 表示已配中转）", style = MaterialTheme.typography.labelMedium)
+                if (selectedMembers.isNotEmpty()) {
+                    Text("已选成员顺序（${selectedMembers.size} 项，可上下调整）", style = MaterialTheme.typography.labelMedium)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        selectedMembers.forEachIndexed { idx, member ->
+                            Surface(
+                                color = EmeraldActive.copy(alpha = 0.06f),
+                                border = BorderStroke(1.dp, EmeraldActive.copy(alpha = 0.4f)),
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "${idx + 1}. " + if (member in relayedNodeNames) "⛓ $member" else member,
+                                        fontSize = 11.sp,
+                                        color = SlateInk,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            if (idx > 0) {
+                                                val m = selectedMembers.toMutableList()
+                                                val item = m.removeAt(idx)
+                                                m.add(idx - 1, item)
+                                                selectedMembers = m
+                                            }
+                                        },
+                                        modifier = Modifier.size(26.dp)
+                                    ) {
+                                        Icon(Icons.Outlined.ArrowUpward, contentDescription = "上移", modifier = Modifier.size(14.dp))
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            if (idx < selectedMembers.lastIndex) {
+                                                val m = selectedMembers.toMutableList()
+                                                val item = m.removeAt(idx)
+                                                m.add(idx + 1, item)
+                                                selectedMembers = m
+                                            }
+                                        },
+                                        modifier = Modifier.size(26.dp)
+                                    ) {
+                                        Icon(Icons.Outlined.ArrowDownward, contentDescription = "下移", modifier = Modifier.size(14.dp))
+                                    }
+                                    IconButton(
+                                        onClick = { selectedMembers = selectedMembers - member },
+                                        modifier = Modifier.size(26.dp)
+                                    ) {
+                                        Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除", tint = RoseDanger, modifier = Modifier.size(14.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text("添加 / 勾选成员（带 ⛓ 表示已配中转）", style = MaterialTheme.typography.labelMedium)
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     memberCandidates.chunked(2).forEach { rowItems ->
                         Row(

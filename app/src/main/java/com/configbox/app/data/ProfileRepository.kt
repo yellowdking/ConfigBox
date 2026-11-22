@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit
  *     ├── base.yaml
  *     ├── proxies.yaml         (subscription nodes)
  *     ├── custom_proxies.yaml  (user-added / custom nodes)
+ *     ├── node_order.json      (user-defined global node order)
  *     ├── groups.yaml          (editable proxy-groups)
  *     ├── rules.json           (editable rules)
  *     └── rule_providers.yaml
@@ -67,7 +68,19 @@ class ProfileRepository(context: Context) {
         val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
         val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
         val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
-        val allProxies = subProxies + customProxies
+        val combined = subProxies + customProxies
+
+        // Restore exact user-defined node order if persisted
+        val savedOrder = File(dir, "node_order.json").takeIf { it.exists() }?.let {
+            runCatching { json.decodeFromString<List<String>>(it.readText()) }.getOrNull()
+        }
+        val allProxies = if (!savedOrder.isNullOrEmpty()) {
+            val orderIndex = savedOrder.withIndex().associate { it.value to it.index }
+            combined.sortedBy { orderIndex[it.name] ?: Int.MAX_VALUE }
+        } else {
+            combined
+        }
+
         val groups = readGroupListFile(File(dir, "groups.yaml"))
         val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
             runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
@@ -107,6 +120,7 @@ class ProfileRepository(context: Context) {
         val customNodes = updated.proxies.filter { it.source == NodeSource.CUSTOM }
         writeProxyListFile(File(dir, "proxies.yaml"), subNodes)
         writeProxyListFile(File(dir, "custom_proxies.yaml"), customNodes)
+        File(dir, "node_order.json").writeText(json.encodeToString(updated.proxies.map { it.name }))
 
         writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
         File(dir, "rules.json").writeText(json.encodeToString(updated.rules))
