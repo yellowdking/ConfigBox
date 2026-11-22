@@ -7,7 +7,6 @@ import com.configbox.app.model.NodeSource
 import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.ProxyNode
-import com.configbox.app.model.RelayGroup
 import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
 import kotlinx.coroutines.Dispatchers
@@ -20,17 +19,16 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Persists each split Clash profile into its own modular directory:
+ * Persists each split profile into its own modular directory:
  *
  *   filesDir/profiles/<profileId>/
  *     ├── meta.json
  *     ├── base.yaml
  *     ├── proxies.yaml         (subscription nodes)
  *     ├── custom_proxies.yaml  (user-added / custom nodes)
- *     ├── groups.yaml
- *     ├── rules.json
- *     ├── rule_providers.yaml
- *     └── relays.json          (dialer-proxy relay groups)
+ *     ├── groups.yaml          (editable proxy-groups)
+ *     ├── rules.json           (editable rules)
+ *     └── rule_providers.yaml
  */
 class ProfileRepository(context: Context) {
 
@@ -69,28 +67,25 @@ class ProfileRepository(context: Context) {
         val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
         val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
         val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
+        val allProxies = subProxies + customProxies
         val groups = readGroupListFile(File(dir, "groups.yaml"))
         val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
             runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
         } ?: emptyList()
         val ruleProvidersYaml = File(dir, "rule_providers.yaml").takeIf { it.exists() }?.readText() ?: ""
-        val relays = File(dir, "relays.json").takeIf { it.exists() }?.let {
-            runCatching { json.decodeFromString<List<RelayGroup>>(it.readText()) }.getOrDefault(emptyList())
-        } ?: emptyList()
 
         SplitProfile(
             meta = meta.copy(
-                nodeCount = subProxies.size + customProxies.size,
+                nodeCount = allProxies.size,
                 groupCount = groups.size,
                 ruleCount = rules.size,
-                relayGroupCount = relays.size
+                relayBoundCount = allProxies.count { !it.dialerProxy.isNullOrBlank() }
             ),
             baseConfigYaml = baseYaml,
-            proxies = subProxies + customProxies,
+            proxies = allProxies,
             proxyGroups = groups,
             rules = rules,
-            ruleProvidersYaml = ruleProvidersYaml,
-            relayGroups = relays
+            ruleProvidersYaml = ruleProvidersYaml
         )
     }
 
@@ -100,7 +95,7 @@ class ProfileRepository(context: Context) {
             nodeCount = profile.proxies.size,
             groupCount = profile.proxyGroups.size,
             ruleCount = profile.rules.size,
-            relayGroupCount = profile.relayGroups.size
+            relayBoundCount = profile.proxies.count { !it.dialerProxy.isNullOrBlank() }
         )
         val updated = profile.copy(meta = updatedMeta)
         val dir = File(profilesRoot, updatedMeta.id).apply { mkdirs() }
@@ -116,7 +111,6 @@ class ProfileRepository(context: Context) {
         writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
         File(dir, "rules.json").writeText(json.encodeToString(updated.rules))
         File(dir, "rule_providers.yaml").writeText(updated.ruleProvidersYaml)
-        File(dir, "relays.json").writeText(json.encodeToString(updated.relayGroups))
 
         updated
     }

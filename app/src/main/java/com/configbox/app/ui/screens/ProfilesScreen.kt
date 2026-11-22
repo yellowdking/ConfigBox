@@ -325,7 +325,7 @@ private fun ProfileCard(
                 StatChip("${profile.nodeCount} 节点")
                 StatChip("${profile.groupCount} 策略组")
                 StatChip("${profile.ruleCount} 规则")
-                StatChip("${profile.relayGroupCount} 中转组")
+                StatChip("${profile.relayBoundCount} 已中转")
             }
         }
     }

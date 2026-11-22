@@ -186,7 +186,7 @@ fun ExportScreen(
         // Live Compiled YAML Preview
         val lineCount = uiState.compiledYaml.lines().size
         Text(
-            text = "编译后最终 YAML 实时预览（共 $lineCount 行 · 含 ${active.relayGroups.count { it.enabled }} 个启用的中转组）",
+            text = "编译后最终 YAML 实时预览（共 $lineCount 行 · 含 ${active.proxies.count { !it.dialerProxy.isNullOrBlank() }} 个已配置 dialer-proxy 的中转节点）",
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Medium
         )

@@ -89,10 +89,8 @@ fun RulesScreen(
     var editingRule by remember { mutableStateOf<RuleEntry?>(null) }
     var isAddingNew by remember { mutableStateOf(false) }
 
-    val availableTargets = remember(active.proxyGroups, active.relayGroups) {
-        (active.relayGroups.map { it.name } +
-            active.proxyGroups.map { it.name } +
-            listOf("DIRECT", "REJECT")).distinct()
+    val availableTargets = remember(active.proxyGroups) {
+        (active.proxyGroups.map { it.name } + listOf("DIRECT", "REJECT")).distinct()
     }
 
     val filteredRules = remember(active.rules, searchQuery) {

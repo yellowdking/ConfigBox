@@ -9,7 +9,7 @@ enum class NodeSource {
 }
 
 /**
- * Metadata persisted in meta.json for each split Clash profile.
+ * Metadata persisted in meta.json for each split YAML profile.
  */
 @Serializable
 data class ProfileMeta(
@@ -21,13 +21,12 @@ data class ProfileMeta(
     val nodeCount: Int = 0,
     val groupCount: Int = 0,
     val ruleCount: Int = 0,
-    val relayGroupCount: Int = 0
+    val relayBoundCount: Int = 0
 )
 
 /**
  * An independent proxy node split out of `proxies:`.
- * [rawYaml] stores the exact single-node YAML block so all protocol-specific
- * fields (reality-opts, ws-opts, grpc-opts, alpn, sni, etc.) are preserved losslessly.
+ * When relay is configured, [dialerProxy] is written directly onto this node (`dialer-proxy`).
  */
 data class ProxyNode(
     val id: String = UUID.randomUUID().toString().take(8),
@@ -55,7 +54,7 @@ data class ProxyGroupEntry(
 )
 
 /**
- * A single Clash routing rule split out of `rules:`.
+ * A single routing rule split out of `rules:`.
  */
 @Serializable
 data class RuleEntry(
@@ -85,30 +84,7 @@ data class RuleEntry(
 }
 
 /**
- * Mihomo `dialer-proxy` chain relay group definition.
- *
- * Traffic flow:
- *   Device -> [entryProxy] -> [middleProxies...] -> each of [exitProxies] -> Target
- *
- * During compilation, original nodes stay untouched; cloned derived nodes with
- * `dialer-proxy` injected are emitted alongside a dedicated proxy-group named [name].
- */
-@Serializable
-data class RelayGroup(
-    val id: String = UUID.randomUUID().toString().take(8),
-    val name: String,
-    val groupType: String = "select", // "select" or "url-test"
-    val entryProxy: String,           // Node name OR existing proxy-group name
-    val middleProxies: List<String> = emptyList(),
-    val exitProxies: List<String> = emptyList(),
-    val injectToMainGroups: Boolean = true,
-    val enabled: Boolean = true,
-    val testUrl: String = "https://www.gstatic.com/generate_204",
-    val interval: Int = 300
-)
-
-/**
- * Complete modular representation of a split Clash configuration.
+ * Complete modular representation of a split configuration.
  */
 data class SplitProfile(
     val meta: ProfileMeta,
@@ -116,6 +92,5 @@ data class SplitProfile(
     val proxies: List<ProxyNode>,
     val proxyGroups: List<ProxyGroupEntry>,
     val rules: List<RuleEntry>,
-    val ruleProvidersYaml: String,
-    val relayGroups: List<RelayGroup>
+    val ruleProvidersYaml: String
 )

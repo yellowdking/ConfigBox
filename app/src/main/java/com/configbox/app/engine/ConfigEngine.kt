@@ -4,24 +4,20 @@ import com.configbox.app.model.NodeSource
 import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.ProxyNode
-import com.configbox.app.model.RelayGroup
 import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
+import java.util.UUID
 
 /**
  * Core engine responsible for:
- * 1. Splitting an imported Clash/Mihomo YAML into independent modules (base, proxies, groups, rules, rule-providers).
- * 2. Refreshing subscription nodes without clobbering custom nodes, rule edits, or dialer-proxy relay groups.
- * 3. Compiling all modules + Mihomo `dialer-proxy` relay groups back into a valid Clash/Mihomo YAML.
+ * 1. Splitting an imported Clash/Mihomo YAML into independent modules (base, proxies, proxy-groups, rules, rule-providers).
+ * 2. Refreshing subscription nodes without clobbering custom nodes, custom proxy groups, rule edits, or node `dialer-proxy` bindings.
+ * 3. Compiling all modules cleanly back into a valid Mihomo/Clash YAML without injecting hidden duplicate nodes or groups.
  */
 object ConfigEngine {
 
     private val SPLIT_KEYS = setOf("proxies", "proxy-groups", "rules", "rule-providers")
 
-    /**
-     * Automatically splits a monolithic Clash YAML file into independent editable modules.
-     */
-    @Suppress("UNCHECKED_CAST")
     fun splitConfig(
         rawYaml: String,
         profileName: String,
@@ -29,7 +25,6 @@ object ConfigEngine {
     ): SplitProfile {
         val root = YamlCodec.parseMap(rawYaml)
 
-        // 1. Base global config (port, dns, tun, sniffer, mode, etc.)
         val baseMap = LinkedHashMap<String, Any?>()
         for ((key, value) in root) {
             if (key !in SPLIT_KEYS) {
@@ -38,28 +33,24 @@ object ConfigEngine {
         }
         val baseYaml = if (baseMap.isEmpty()) defaultBaseYaml() else YamlCodec.dump(baseMap)
 
-        // 2. Proxies
         val rawProxies = (root["proxies"] as? List<*>) ?: emptyList<Any?>()
         val proxies = rawProxies.mapNotNull { item ->
             val map = item as? Map<*, *> ?: return@mapNotNull null
             mapToProxyNode(map, NodeSource.SUBSCRIPTION)
         }
 
-        // 3. Proxy Groups
         val rawGroups = (root["proxy-groups"] as? List<*>) ?: emptyList<Any?>()
         val groups = rawGroups.mapNotNull { item ->
             val map = item as? Map<*, *> ?: return@mapNotNull null
             mapToProxyGroup(map)
         }
 
-        // 4. Rules
         val rawRules = (root["rules"] as? List<*>) ?: emptyList<Any?>()
         val rules = rawRules.mapNotNull { item ->
             val line = item?.toString()?.trim()
             if (line.isNullOrBlank()) null else parseRuleLine(line)
         }
 
-        // 5. Rule Providers
         val ruleProvidersMap = root["rule-providers"] as? Map<*, *>
         val ruleProvidersYaml = if (ruleProvidersMap != null && ruleProvidersMap.isNotEmpty()) {
             YamlCodec.dump(ruleProvidersMap)
@@ -76,7 +67,7 @@ object ConfigEngine {
             nodeCount = proxies.size,
             groupCount = groups.size,
             ruleCount = rules.size,
-            relayGroupCount = 0
+            relayBoundCount = proxies.count { !it.dialerProxy.isNullOrBlank() }
         )
 
         return SplitProfile(
@@ -85,60 +76,61 @@ object ConfigEngine {
             proxies = proxies,
             proxyGroups = groups,
             rules = rules,
-            ruleProvidersYaml = ruleProvidersYaml,
-            relayGroups = emptyList()
+            ruleProvidersYaml = ruleProvidersYaml
         )
     }
 
     /**
-     * Refreshes ONLY subscription-sourced nodes from a newly fetched YAML while preserving:
+     * Refreshes ONLY subscription-sourced nodes while preserving:
      * - all user-added CUSTOM nodes
-     * - all custom rule edits
-     * - all `dialer-proxy` relay groups
-     * - base config settings
+     * - all existing `dialer-proxy` bindings by node name
+     * - all user-edited proxy-groups & rules
      */
     fun refreshSubscriptionNodes(
         existing: SplitProfile,
         freshRawYaml: String
     ): SplitProfile {
         val fresh = splitConfig(freshRawYaml, existing.meta.name, existing.meta.subscriptionUrl)
-        val customNodes = existing.proxies.filter { it.source == NodeSource.CUSTOM }
-        val freshSubNames = fresh.proxies.map { it.name }.toSet()
-        // Keep custom nodes (avoid exact name collision by keeping custom nodes distinct)
-        val mergedNodes = fresh.proxies + customNodes.filter { it.name !in freshSubNames }
+        val savedDialerByName = existing.proxies
+            .filter { !it.dialerProxy.isNullOrBlank() }
+            .associate { it.name to it.dialerProxy }
 
-        // Refresh proxy-groups proxy references if a group existed in fresh subscription,
-        // otherwise keep existing groups.
-        val updatedGroups = if (fresh.proxyGroups.isNotEmpty()) {
-            fresh.proxyGroups
-        } else {
-            existing.proxyGroups
+        val refreshedSubNodes = fresh.proxies.map { node ->
+            val savedDialer = savedDialerByName[node.name]
+            if (!savedDialer.isNullOrBlank()) {
+                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, savedDialer)
+            } else {
+                node
+            }
         }
+
+        val customNodes = existing.proxies.filter { it.source == NodeSource.CUSTOM }
+        val freshSubNames = refreshedSubNodes.map { it.name }.toSet()
+        val mergedNodes = refreshedSubNodes + customNodes.filter { it.name !in freshSubNames }
 
         return existing.copy(
             proxies = mergedNodes,
-            proxyGroups = updatedGroups,
             meta = existing.meta.copy(
                 updatedAt = System.currentTimeMillis(),
                 nodeCount = mergedNodes.size,
-                groupCount = updatedGroups.size
+                groupCount = existing.proxyGroups.size,
+                relayBoundCount = mergedNodes.count { !it.dialerProxy.isNullOrBlank() }
             )
         )
     }
 
     /**
-     * Compiles all split modules + `dialer-proxy` relay groups into a ready-to-use Mihomo/Clash YAML.
+     * Compiles all split modules cleanly into a ready-to-use Mihomo/Clash YAML.
+     * `dialer-proxy` is emitted directly on each bound exit node; no extra hidden groups are added.
      */
     fun compileConfig(profile: SplitProfile): String {
         val output = LinkedHashMap<String, Any?>()
 
-        // 1. Base settings
         val baseMap = YamlCodec.parseMap(profile.baseConfigYaml)
         output.putAll(baseMap)
 
-        // 2. Original proxy nodes
         val compiledProxies = mutableListOf<LinkedHashMap<String, Any?>>()
-        val nodeMapByName = LinkedHashMap<String, LinkedHashMap<String, Any?>>()
+        val validNodeNames = mutableSetOf("DIRECT", "REJECT")
 
         for (node in profile.proxies) {
             val map = YamlCodec.parseMap(node.rawYaml)
@@ -153,96 +145,31 @@ object ConfigEngine {
                 map.remove("dialer-proxy")
             }
             compiledProxies.add(map)
-            nodeMapByName[node.name] = map
+            validNodeNames.add(node.name)
         }
-
-        // 3. Generate Mihomo `dialer-proxy` chained nodes & relay proxy-groups
-        val generatedRelayGroups = mutableListOf<LinkedHashMap<String, Any?>>()
-        val relayGroupsToInject = mutableListOf<String>()
-        val existingNames = compiledProxies.mapNotNull { it["name"]?.toString() }.toMutableSet()
-
-        for (relay in profile.relayGroups.filter { it.enabled }) {
-            if (relay.entryProxy.isBlank() || relay.exitProxies.isEmpty()) continue
-
-            // Build optional intermediate hop chain: entry -> mid1 -> mid2 -> ...
-            var currentDialer = relay.entryProxy
-            relay.middleProxies.forEachIndexed { idx, midName ->
-                val midSource = nodeMapByName[midName] ?: return@forEachIndexed
-                val clonedMid = copyNodeMap(midSource)
-                val derivedMidName = uniqueName("[${relay.name}#${idx + 1}] $midName", existingNames)
-                clonedMid["name"] = derivedMidName
-                clonedMid["dialer-proxy"] = currentDialer
-                compiledProxies.add(clonedMid)
-                existingNames.add(derivedMidName)
-                currentDialer = derivedMidName
-            }
-
-            // Build exit nodes chained onto currentDialer
-            val chainedExitNames = mutableListOf<String>()
-            for (exitName in relay.exitProxies) {
-                val exitSource = nodeMapByName[exitName] ?: continue
-                val clonedExit = copyNodeMap(exitSource)
-                val derivedExitName = uniqueName("[${relay.name}] $exitName", existingNames)
-                clonedExit["name"] = derivedExitName
-                clonedExit["dialer-proxy"] = currentDialer
-                compiledProxies.add(clonedExit)
-                existingNames.add(derivedExitName)
-                chainedExitNames.add(derivedExitName)
-            }
-
-            if (chainedExitNames.isNotEmpty()) {
-                val groupMap = LinkedHashMap<String, Any?>()
-                groupMap["name"] = relay.name
-                groupMap["type"] = relay.groupType.ifBlank { "select" }
-                groupMap["proxies"] = chainedExitNames
-                if (relay.groupType == "url-test" || relay.groupType == "fallback") {
-                    groupMap["url"] = relay.testUrl.ifBlank { "https://www.gstatic.com/generate_204" }
-                    groupMap["interval"] = relay.interval.coerceAtLeast(60)
-                }
-                generatedRelayGroups.add(groupMap)
-                if (relay.injectToMainGroups) {
-                    relayGroupsToInject.add(relay.name)
-                }
-            }
-        }
-
         output["proxies"] = compiledProxies
 
-        // 4. Proxy groups (preserving original groups + injecting relay groups if requested)
+        val allGroupNames = profile.proxyGroups.map { it.name }.toSet()
         val compiledGroups = mutableListOf<LinkedHashMap<String, Any?>>()
-        val validNodeNames = existingNames + setOf("DIRECT", "REJECT")
-        val allGroupNames = profile.proxyGroups.map { it.name }.toSet() +
-            generatedRelayGroups.mapNotNull { it["name"]?.toString() }.toSet()
-
         for (group in profile.proxyGroups) {
             val map = YamlCodec.parseMap(group.rawYaml)
             map["name"] = group.name
             map["type"] = group.type
-
-            val currentList = ((map["proxies"] as? List<*>)?.map { it.toString() } ?: group.proxies)
-                .filter { it in validNodeNames || it in allGroupNames }
-                .toMutableList()
-
-            // Inject enabled relay groups at the top of select groups
-            if (group.type == "select" && relayGroupsToInject.isNotEmpty()) {
-                for (relayName in relayGroupsToInject.reversed()) {
-                    if (relayName !in currentList && relayName != group.name) {
-                        currentList.add(0, relayName)
-                    }
-                }
+            val filteredMembers = group.proxies
+                .filter { it in validNodeNames || (it in allGroupNames && it != group.name) }
+                .ifEmpty { listOf("DIRECT") }
+            map["proxies"] = filteredMembers
+            if (group.type == "url-test" || group.type == "fallback" || group.type == "load-balance") {
+                map["url"] = group.url?.takeIf { it.isNotBlank() } ?: "https://www.gstatic.com/generate_204"
+                map["interval"] = (group.interval ?: 300).coerceAtLeast(60)
+            } else {
+                map.remove("url")
+                map.remove("interval")
             }
-            if (currentList.isEmpty()) {
-                currentList.add("DIRECT")
-            }
-            map["proxies"] = currentList
             compiledGroups.add(map)
         }
-
-        // Append generated relay groups
-        compiledGroups.addAll(generatedRelayGroups)
         output["proxy-groups"] = compiledGroups
 
-        // 5. Rule providers (if any)
         if (profile.ruleProvidersYaml.isNotBlank()) {
             val providersMap = YamlCodec.parseMap(profile.ruleProvidersYaml)
             if (providersMap.isNotEmpty()) {
@@ -250,37 +177,73 @@ object ConfigEngine {
             }
         }
 
-        // 6. Enabled rules
-        val compiledRules = profile.rules
+        output["rules"] = profile.rules
             .filter { it.enabled }
             .map { it.toClashRuleString() }
-        output["rules"] = compiledRules
 
         return YamlCodec.dump(output)
     }
 
     /**
-     * Generates a focused YAML preview snippet for a single [RelayGroup] so the user can
-     * inspect the exact `dialer-proxy` nodes and group that will be emitted.
+     * Builds or updates a [ProxyGroupEntry] with clean serialized YAML.
      */
-    fun previewRelayGroupYaml(profile: SplitProfile, relay: RelayGroup): String {
-        val tempProfile = profile.copy(
-            proxyGroups = emptyList(),
-            rules = emptyList(),
-            ruleProvidersYaml = "",
-            relayGroups = listOf(relay.copy(enabled = true, injectToMainGroups = false))
+    fun buildProxyGroup(
+        id: String = UUID.randomUUID().toString().take(8),
+        name: String,
+        type: String,
+        proxies: List<String>,
+        url: String? = null,
+        interval: Int? = null
+    ): ProxyGroupEntry {
+        val cleanName = name.trim()
+        val cleanType = type.trim().ifBlank { "select" }
+        val cleanProxies = proxies.distinct().ifEmpty { listOf("DIRECT") }
+        val map = linkedMapOf<String, Any?>(
+            "name" to cleanName,
+            "type" to cleanType,
+            "proxies" to cleanProxies
         )
-        val fullMap = YamlCodec.parseMap(compileConfig(tempProfile))
-        val originalNames = profile.proxies.map { it.name }.toSet()
-        val allProxies = (fullMap["proxies"] as? List<*>)?.filterIsInstance<Map<*, *>>() ?: emptyList()
-        val derivedOnly = allProxies.filter { it["name"]?.toString() !in originalNames }
-        val groupsOnly = fullMap["proxy-groups"] ?: emptyList<Any>()
-        return YamlCodec.dump(
-            linkedMapOf(
-                "proxies" to derivedOnly,
-                "proxy-groups" to groupsOnly
-            )
+        val effectiveUrl = if (cleanType in setOf("url-test", "fallback", "load-balance")) {
+            url?.trim()?.ifBlank { "https://www.gstatic.com/generate_204" }
+                ?: "https://www.gstatic.com/generate_204"
+        } else {
+            null
+        }
+        val effectiveInterval = if (cleanType in setOf("url-test", "fallback", "load-balance")) {
+            (interval ?: 300).coerceAtLeast(60)
+        } else {
+            null
+        }
+        if (effectiveUrl != null) map["url"] = effectiveUrl
+        if (effectiveInterval != null) map["interval"] = effectiveInterval
+
+        return ProxyGroupEntry(
+            id = id,
+            name = cleanName,
+            type = cleanType,
+            proxies = cleanProxies,
+            url = effectiveUrl,
+            interval = effectiveInterval,
+            rawYaml = YamlCodec.dump(map)
         )
+    }
+
+    /**
+     * Directly binds (or clears) `dialer-proxy` on the specified exit node IDs.
+     */
+    fun applyDialerProxy(
+        nodes: List<ProxyNode>,
+        exitNodeIds: Set<String>,
+        entryProxy: String?
+    ): List<ProxyNode> {
+        val cleanEntry = entryProxy?.trim()?.ifBlank { null }
+        return nodes.map { node ->
+            if (node.id in exitNodeIds) {
+                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, cleanEntry)
+            } else {
+                node
+            }
+        }
     }
 
     fun parseRuleLine(line: String): RuleEntry {
@@ -391,18 +354,6 @@ object ConfigEngine {
         )
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun copyNodeMap(source: LinkedHashMap<String, Any?>): LinkedHashMap<String, Any?> {
-        return YamlCodec.deepCopy(source) as LinkedHashMap<String, Any?>
-    }
-
-    private fun uniqueName(base: String, existing: Set<String>): String {
-        if (base !in existing) return base
-        var idx = 2
-        while ("$base #$idx" in existing) idx++
-        return "$base #$idx"
-    }
-
     private fun defaultBaseYaml(): String = """
         mixed-port: 7890
         allow-lan: false
@@ -463,16 +414,17 @@ object ConfigEngine {
             username: homeuser
             password: homepassword
             udp: true
+            dialer-proxy: "♻️ 自动测速"
 
         proxy-groups:
           - name: "🚀 节点选择"
             type: select
             proxies:
               - "♻️ 自动测速"
+              - "🏠 家宽落地"
               - "香港 IPLC 01"
               - "新加坡高速 02"
               - "日本东京 03"
-              - "美国住宅家宽落地"
               - DIRECT
           - name: "♻️ 自动测速"
             type: url-test
@@ -482,10 +434,14 @@ object ConfigEngine {
               - "香港 IPLC 01"
               - "新加坡高速 02"
               - "日本东京 03"
+          - name: "🏠 家宽落地"
+            type: select
+            proxies:
+              - "美国住宅家宽落地"
 
         rules:
-          - DOMAIN-SUFFIX,openai.com,🚀 节点选择
-          - DOMAIN-SUFFIX,claude.ai,🚀 节点选择
+          - DOMAIN-SUFFIX,openai.com,🏠 家宽落地
+          - DOMAIN-SUFFIX,claude.ai,🏠 家宽落地
           - DOMAIN-SUFFIX,github.com,🚀 节点选择
           - DOMAIN-SUFFIX,google.com,🚀 节点选择
           - GEOIP,LAN,DIRECT,no-resolve

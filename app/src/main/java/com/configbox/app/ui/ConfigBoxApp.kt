@@ -7,14 +7,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.Rule
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,15 +47,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.configbox.app.ui.screens.ExportScreen
+import com.configbox.app.ui.screens.GroupsScreen
 import com.configbox.app.ui.screens.NodesScreen
 import com.configbox.app.ui.screens.ProfilesScreen
-import com.configbox.app.ui.screens.RelaysScreen
 import com.configbox.app.ui.screens.RulesScreen
 import com.configbox.app.ui.theme.BorderGray
 import com.configbox.app.ui.theme.EmeraldActive
 import com.configbox.app.ui.theme.PureWhite
 import com.configbox.app.ui.theme.SkyAccent
-import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 import com.configbox.app.ui.theme.SoftSurface
 
@@ -80,8 +78,8 @@ fun ConfigBoxApp(viewModel: ConfigBoxViewModel) {
     val tabs = listOf(
         NavTab("配置", Icons.Outlined.FolderOpen),
         NavTab("节点", Icons.Outlined.Dns),
+        NavTab("策略组", Icons.Outlined.Layers),
         NavTab("规则", Icons.Outlined.Rule),
-        NavTab("中转", Icons.Outlined.AccountTree),
         NavTab("导出", Icons.Outlined.Share)
     )
 
@@ -176,8 +174,8 @@ fun ConfigBoxApp(viewModel: ConfigBoxViewModel) {
             when (selectedTab) {
                 0 -> ProfilesScreen(uiState = uiState, viewModel = viewModel)
                 1 -> NodesScreen(uiState = uiState, viewModel = viewModel)
-                2 -> RulesScreen(uiState = uiState, viewModel = viewModel)
-                3 -> RelaysScreen(uiState = uiState, viewModel = viewModel)
+                2 -> GroupsScreen(uiState = uiState, viewModel = viewModel)
+                3 -> RulesScreen(uiState = uiState, viewModel = viewModel)
                 4 -> ExportScreen(uiState = uiState, viewModel = viewModel)
             }
         }

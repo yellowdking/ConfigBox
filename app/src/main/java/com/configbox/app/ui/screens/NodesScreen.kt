@@ -18,9 +18,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -62,6 +65,7 @@ import com.configbox.app.ui.theme.EmeraldActive
 import com.configbox.app.ui.theme.PureWhite
 import com.configbox.app.ui.theme.RoseDanger
 import com.configbox.app.ui.theme.SkyAccent
+import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 import com.configbox.app.ui.theme.SoftSurface
 
@@ -72,23 +76,26 @@ fun NodesScreen(
 ) {
     val active = uiState.activeProfile
     if (active == null) {
-        EmptyProfileNotice("请先在「配置」页导入或选择一个 Clash 配置文件")
+        EmptyProfileNotice("请先在「配置」页导入或选择一个配置文件")
         return
     }
 
+    var subTab by remember { mutableIntStateOf(0) } // 0 = 全部节点, 1 = 中转配置 (dialer-proxy)
     var searchQuery by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf("全部") }
-    var showAddDialog by remember { mutableStateOf(false) }
+    var showAddNodeDialog by remember { mutableStateOf(false) }
+    var showRelayBindDialog by remember { mutableStateOf(false) }
     var editingNode by remember { mutableStateOf<ProxyNode?>(null) }
 
     val protocolFilters = remember(active.proxies) {
-        listOf("全部", "自定义") + active.proxies.map { it.type.uppercase() }.distinct().sorted()
+        listOf("全部", "已中转", "自定义") + active.proxies.map { it.type.uppercase() }.distinct().sorted()
     }
 
     val filteredNodes = remember(active.proxies, searchQuery, selectedFilter) {
         active.proxies.filter { node ->
             val matchFilter = when (selectedFilter) {
                 "全部" -> true
+                "已中转" -> !node.dialerProxy.isNullOrBlank()
                 "自定义" -> node.source == NodeSource.CUSTOM
                 else -> node.type.equals(selectedFilter, ignoreCase = true)
             }
@@ -99,79 +106,191 @@ fun NodesScreen(
         }
     }
 
+    val relayedNodes = remember(active.proxies) {
+        active.proxies.filter { !it.dialerProxy.isNullOrBlank() }
+    }
+
+    val entryCandidates = remember(active.proxyGroups, active.proxies) {
+        active.proxyGroups.map { it.name } + active.proxies.map { it.name }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            Surface(color = PureWhite) {
-                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("搜索节点名称或服务器地址...", fontSize = 13.sp) },
-                        leadingIcon = { Icon(Icons.Outlined.Search, null, Modifier.size(18.dp)) },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        protocolFilters.forEach { tag ->
-                            FilterChip(
-                                selected = selectedFilter == tag,
-                                onClick = { selectedFilter = tag },
-                                label = { Text(tag, fontSize = 12.sp) }
-                            )
+            TabRow(selectedTabIndex = subTab, containerColor = PureWhite) {
+                Tab(
+                    selected = subTab == 0,
+                    onClick = { subTab = 0 },
+                    text = { Text("全部节点 (${active.proxies.size})", fontSize = 13.sp) }
+                )
+                Tab(
+                    selected = subTab == 1,
+                    onClick = { subTab = 1 },
+                    text = { Text("中转绑定 (${relayedNodes.size})", fontSize = 13.sp) }
+                )
+            }
+
+            if (subTab == 0) {
+                Surface(color = PureWhite) {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("搜索节点名称或服务器地址...", fontSize = 13.sp) },
+                            leadingIcon = { Icon(Icons.Outlined.Search, null, Modifier.size(18.dp)) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            protocolFilters.forEach { tag ->
+                                FilterChip(
+                                    selected = selectedFilter == tag,
+                                    onClick = { selectedFilter = tag },
+                                    label = { Text(tag, fontSize = 12.sp) }
+                                )
+                            }
                         }
                     }
                 }
-            }
 
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 84.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                item {
-                    Text(
-                        text = "共 ${filteredNodes.size} / ${active.proxies.size} 个独立节点（点击可编辑基础项或原始 YAML）",
-                        style = MaterialTheme.typography.labelMedium
-                    )
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 84.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(filteredNodes, key = { it.id }) { node ->
+                        NodeCard(
+                            node = node,
+                            onClick = { editingNode = node },
+                            onDelete = { viewModel.deleteNode(node.id) }
+                        )
+                    }
                 }
-                items(filteredNodes, key = { it.id }) { node ->
-                    NodeCard(
-                        node = node,
-                        onClick = { editingNode = node },
-                        onDelete = { viewModel.deleteNode(node.id) }
-                    )
+            } else {
+                // Direct 2-hop dialer-proxy binding screen (Entry -> Exit, no middle hop, no auto-created group)
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item {
+                        Surface(
+                            color = PureWhite,
+                            border = BorderStroke(1.dp, BorderGray),
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Text("简洁中转绑定（入口前置 → 出口落地）", style = MaterialTheme.typography.titleMedium)
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = "配置后直接在出口落地节点上写入 dialer-proxy，不生成多余副本和隐藏策略组；如需独立分组，直接在「策略组」页手动创建即可。",
+                                    fontSize = 12.sp,
+                                    color = SlateMuted
+                                )
+                            }
+                        }
+                    }
+
+                    if (relayedNodes.isEmpty()) {
+                        item {
+                            Surface(
+                                color = PureWhite,
+                                border = BorderStroke(1.dp, BorderGray),
+                                shape = MaterialTheme.shapes.medium,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "暂无已配置中转的落地节点，点击右下角按钮为出口落地节点绑定入口前置代理。",
+                                    modifier = Modifier.padding(20.dp),
+                                    fontSize = 13.sp,
+                                    color = SlateMuted
+                                )
+                            }
+                        }
+                    } else {
+                        items(relayedNodes, key = { it.id }) { node ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(containerColor = PureWhite),
+                                border = BorderStroke(1.5.dp, EmeraldActive),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "入口 [${node.dialerProxy}] → 出口 [${node.name}]",
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = SlateInk
+                                        )
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(
+                                            text = "dialer-proxy: ${node.dialerProxy}  ·  ${node.server}:${node.port}",
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 11.sp,
+                                            color = SlateMuted
+                                        )
+                                    }
+                                    IconButton(onClick = { viewModel.clearNodeRelay(node.id) }) {
+                                        Icon(Icons.Outlined.LinkOff, contentDescription = "解绑中转", tint = RoseDanger)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
         FloatingActionButton(
-            onClick = { showAddDialog = true },
+            onClick = { if (subTab == 0) showAddNodeDialog = true else showRelayBindDialog = true },
             containerColor = SkyAccent,
             contentColor = PureWhite,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(16.dp)
         ) {
-            Icon(Icons.Outlined.Add, contentDescription = "添加节点")
+            Icon(
+                imageVector = if (subTab == 0) Icons.Outlined.Add else Icons.Outlined.Link,
+                contentDescription = if (subTab == 0) "添加节点" else "绑定中转"
+            )
         }
     }
 
-    if (showAddDialog) {
+    if (showAddNodeDialog) {
         AddNodeDialog(
-            onDismiss = { showAddDialog = false },
+            onDismiss = { showAddNodeDialog = false },
             onAddUri = { uri ->
-                showAddDialog = false
+                showAddNodeDialog = false
                 viewModel.addNodeFromUri(uri)
             },
             onAddYaml = { yaml ->
-                showAddDialog = false
+                showAddNodeDialog = false
                 viewModel.addNodeFromYaml(yaml)
+            }
+        )
+    }
+
+    if (showRelayBindDialog) {
+        BindRelayDialog(
+            entryCandidates = entryCandidates,
+            nodes = active.proxies,
+            onDismiss = { showRelayBindDialog = false },
+            onBind = { entry, exitIds ->
+                showRelayBindDialog = false
+                viewModel.bindRelayToNodes(exitIds, entry)
             }
         )
     }
@@ -179,6 +298,7 @@ fun NodesScreen(
     editingNode?.let { node ->
         EditNodeDialog(
             node = node,
+            entryCandidates = entryCandidates,
             onDismiss = { editingNode = null },
             onSaveBasic = { name, server, port, udp, dialer ->
                 editingNode = null
@@ -190,6 +310,92 @@ fun NodesScreen(
             }
         )
     }
+}
+
+@Composable
+private fun BindRelayDialog(
+    entryCandidates: List<String>,
+    nodes: List<ProxyNode>,
+    onDismiss: () -> Unit,
+    onBind: (entryProxy: String, exitNodeIds: Set<String>) -> Unit
+) {
+    var entryProxy by remember { mutableStateOf(entryCandidates.firstOrNull().orEmpty()) }
+    var selectedExitIds by remember { mutableStateOf(setOf<String>()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("配置节点中转 (dialer-proxy)") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("1. 选择入口前置代理（策略组或单节点）", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    entryCandidates.forEach { candidate ->
+                        FilterChip(
+                            selected = entryProxy == candidate,
+                            onClick = { entryProxy = candidate },
+                            label = { Text(candidate, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Text("2. 选择出口落地节点（可多选，直接写入 dialer-proxy）", style = MaterialTheme.typography.labelMedium)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    nodes.filter { it.name != entryProxy }.forEach { node ->
+                        val isSelected = node.id in selectedExitIds
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedExitIds = if (isSelected) selectedExitIds - node.id else selectedExitIds + node.id
+                                },
+                            color = if (isSelected) EmeraldActive.copy(alpha = 0.1f) else SoftSurface,
+                            border = BorderStroke(1.dp, if (isSelected) EmeraldActive else BorderGray),
+                            shape = MaterialTheme.shapes.small
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = node.name,
+                                    fontSize = 12.sp,
+                                    color = if (isSelected) EmeraldActive else SlateInk,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = node.type.uppercase(),
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 10.sp,
+                                    color = SlateMuted
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                onClick = { onBind(entryProxy, selectedExitIds) },
+                enabled = entryProxy.isNotBlank() && selectedExitIds.isNotEmpty()
+            ) {
+                Text("写入 dialer-proxy")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
 }
 
 @Composable
@@ -334,6 +540,7 @@ private fun AddNodeDialog(
 @Composable
 private fun EditNodeDialog(
     node: ProxyNode,
+    entryCandidates: List<String>,
     onDismiss: () -> Unit,
     onSaveBasic: (name: String, server: String, port: Int, udp: Boolean, dialerProxy: String?) -> Unit,
     onSaveRawYaml: (String) -> Unit
@@ -358,7 +565,10 @@ private fun EditNodeDialog(
                 }
                 Spacer(Modifier.height(10.dp))
                 if (tab == 0) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         OutlinedTextField(
                             value = name,
                             onValueChange = { name = it },
@@ -382,11 +592,30 @@ private fun EditNodeDialog(
                                 modifier = Modifier.weight(1f)
                             )
                         }
+                        Text("快捷选择入口前置 (dialer-proxy)", style = MaterialTheme.typography.labelMedium)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            FilterChip(
+                                selected = dialerProxy.isBlank(),
+                                onClick = { dialerProxy = "" },
+                                label = { Text("不中转", fontSize = 11.sp) }
+                            )
+                            entryCandidates.filter { it != node.name }.forEach { candidate ->
+                                FilterChip(
+                                    selected = dialerProxy == candidate,
+                                    onClick = { dialerProxy = candidate },
+                                    label = { Text(candidate, fontSize = 11.sp) }
+                                )
+                            }
+                        }
                         OutlinedTextField(
                             value = dialerProxy,
                             onValueChange = { dialerProxy = it },
-                            label = { Text("单节点 dialer-proxy（可选，留空直连）") },
-                            placeholder = { Text("填写前置节点名或策略组名") },
+                            label = { Text("dialer-proxy（留空直连）") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )

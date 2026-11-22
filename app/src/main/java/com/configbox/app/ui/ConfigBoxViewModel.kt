@@ -8,8 +8,7 @@ import com.configbox.app.engine.ConfigEngine
 import com.configbox.app.engine.ProxyUriParser
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.ProfileMeta
-import com.configbox.app.model.ProxyNode
-import com.configbox.app.model.RelayGroup
+import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
 import com.configbox.app.server.LocalSubServer
@@ -116,7 +115,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         activeProfile = saved,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "已自动拆分：${saved.proxies.size} 个节点 · ${saved.proxyGroups.size} 个策略组 · ${saved.rules.size} 条规则"
+                        snackbarMessage = "已自动拆分：${saved.proxies.size} 节点 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
                     )
                 }
             }.onFailure { err ->
@@ -146,7 +145,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         activeProfile = saved,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "订阅已拉取并拆分：${saved.proxies.size} 个节点 · ${saved.rules.size} 条规则"
+                        snackbarMessage = "订阅已拉取并拆分：${saved.proxies.size} 节点 · ${saved.proxyGroups.size} 策略组"
                     )
                 }
             }.onFailure { err ->
@@ -191,7 +190,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         activeProfile = if (isActive) saved else it.activeProfile,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "已仅更新订阅节点，自定义节点、规则与中转组均已保留"
+                        snackbarMessage = "已仅更新订阅节点，自定义节点、策略组、规则与中转绑定均已保留"
                     )
                 }
             }.onFailure { err ->
@@ -225,7 +224,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    // --- Node Operations ---
+    // --- Node & Direct `dialer-proxy` Operations ---
 
     fun addNodeFromUri(uriText: String) {
         val profile = _uiState.value.activeProfile ?: return
@@ -278,11 +277,74 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun bindRelayToNodes(exitNodeIds: Set<String>, entryProxy: String) {
+        val profile = _uiState.value.activeProfile ?: return
+        if (exitNodeIds.isEmpty() || entryProxy.isBlank()) return
+        val updatedNodes = ConfigEngine.applyDialerProxy(profile.proxies, exitNodeIds, entryProxy)
+        mutateActiveProfile(
+            profile.copy(proxies = updatedNodes),
+            "已为 ${exitNodeIds.size} 个落地节点写入 dialer-proxy: $entryProxy"
+        )
+    }
+
+    fun clearNodeRelay(nodeId: String) {
+        val profile = _uiState.value.activeProfile ?: return
+        val updatedNodes = ConfigEngine.applyDialerProxy(profile.proxies, setOf(nodeId), null)
+        mutateActiveProfile(profile.copy(proxies = updatedNodes), "已取消该节点的 dialer-proxy 中转")
+    }
+
     fun deleteNode(nodeId: String) {
         val profile = _uiState.value.activeProfile ?: return
         mutateActiveProfile(
             profile.copy(proxies = profile.proxies.filterNot { it.id == nodeId }),
             "已删除节点"
+        )
+    }
+
+    // --- Proxy Group Operations ---
+
+    fun upsertProxyGroup(
+        existingId: String?,
+        name: String,
+        type: String,
+        proxies: List<String>,
+        url: String?,
+        interval: Int?
+    ) {
+        val profile = _uiState.value.activeProfile ?: return
+        val built = if (existingId != null) {
+            ConfigEngine.buildProxyGroup(existingId, name, type, proxies, url, interval)
+        } else {
+            ConfigEngine.buildProxyGroup(name = name, type = type, proxies = proxies, url = url, interval = interval)
+        }
+        val exists = existingId != null && profile.proxyGroups.any { it.id == existingId }
+        val updatedGroups = if (exists) {
+            profile.proxyGroups.map { if (it.id == existingId) built else it }
+        } else {
+            listOf(built) + profile.proxyGroups
+        }
+        mutateActiveProfile(
+            profile.copy(proxyGroups = updatedGroups),
+            if (exists) "策略组已更新" else "已新建策略组：${built.name}"
+        )
+    }
+
+    fun moveProxyGroup(groupId: String, delta: Int) {
+        val profile = _uiState.value.activeProfile ?: return
+        val list = profile.proxyGroups.toMutableList()
+        val idx = list.indexOfFirst { it.id == groupId }
+        val targetIdx = idx + delta
+        if (idx < 0 || targetIdx !in list.indices) return
+        val item = list.removeAt(idx)
+        list.add(targetIdx, item)
+        mutateActiveProfile(profile.copy(proxyGroups = list), null)
+    }
+
+    fun deleteProxyGroup(groupId: String) {
+        val profile = _uiState.value.activeProfile ?: return
+        mutateActiveProfile(
+            profile.copy(proxyGroups = profile.proxyGroups.filterNot { it.id == groupId }),
+            "已删除策略组"
         )
     }
 
@@ -319,41 +381,6 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun deleteRule(ruleId: String) {
         val profile = _uiState.value.activeProfile ?: return
         mutateActiveProfile(profile.copy(rules = profile.rules.filterNot { it.id == ruleId }), "已删除规则")
-    }
-
-    // --- Relay Group (`dialer-proxy`) Operations ---
-
-    fun upsertRelayGroup(relay: RelayGroup) {
-        val profile = _uiState.value.activeProfile ?: return
-        val exists = profile.relayGroups.any { it.id == relay.id }
-        val updated = if (exists) {
-            profile.relayGroups.map { if (it.id == relay.id) relay else it }
-        } else {
-            listOf(relay) + profile.relayGroups
-        }
-        mutateActiveProfile(
-            profile.copy(relayGroups = updated),
-            if (exists) "中转组已更新" else "已创建 dialer-proxy 中转组：${relay.name}"
-        )
-    }
-
-    fun toggleRelayGroup(relayId: String) {
-        val profile = _uiState.value.activeProfile ?: return
-        val updated = profile.relayGroups.map { if (it.id == relayId) it.copy(enabled = !it.enabled) else it }
-        mutateActiveProfile(profile.copy(relayGroups = updated), null)
-    }
-
-    fun deleteRelayGroup(relayId: String) {
-        val profile = _uiState.value.activeProfile ?: return
-        mutateActiveProfile(
-            profile.copy(relayGroups = profile.relayGroups.filterNot { it.id == relayId }),
-            "已删除中转组"
-        )
-    }
-
-    fun previewRelayYaml(relay: RelayGroup): String {
-        val profile = _uiState.value.activeProfile ?: return ""
-        return ConfigEngine.previewRelayGroupYaml(profile, relay)
     }
 
     // --- Local Subscription Server ---
