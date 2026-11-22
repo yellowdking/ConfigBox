@@ -1,34 +1,30 @@
-# ConfigBox — Android Clash 配置模块化拆分与中转组管理 App
+# ConfigBox
 
-ConfigBox 是一款独立的 Android 配置拆分与可视化管理工具（Kotlin + Jetpack Compose + Material 3），面向 Mihomo（Clash.Meta）配置生态设计：
+ConfigBox 是一款轻量级的 Android YAML 配置文件模块化拆分与可视化管理工具（Kotlin + Jetpack Compose + Material 3），适合管理结构复杂、需要分块维护的多段式 YAML 配置文件。
 
-- **初次导入自动拆分**：支持从本地 `.yaml/.yml` 文件、远程订阅链接或剪贴板粘贴导入，自动按模块分离保存到独立文件：
-  - `base.yaml`（全局端口、DNS、TUN、Sniffer 等基础设置）
-  - `proxies.yaml` & `custom_proxies.yaml`（订阅节点与自定义节点分离存储，无损保留 VLESS Reality / WS / gRPC / Hysteria2 等全部协议参数）
-  - `groups.yaml`（策略组）
-  - `rules.json` & `rule_providers.yaml`（独立可开关、可排序的路由规则）
-  - `relays.json`（`dialer-proxy` 节点中转组）
-- **订阅更新不覆盖自定义项**：点击「仅更新订阅节点」时，只刷新远程订阅节点，完整保留你手动添加的落地节点、自定义规则以及中转组。
-- **节点独立管理**：支持协议筛选、快捷 URI 导入（`socks5://`、`http://`、`vless://`、`trojan://`、`hysteria2://`、`ss://`）、基础字段编辑以及原始 YAML 无损编辑。
-- **规则独立管理**：支持搜索、增删改、单条开关、上下移动调整匹配优先级，目标策略可直接选择中转组。
-- **Mihomo `dialer-proxy` 节点中转组**：
-  - 入口前置支持选择**单个节点**或**现有策略组**（如 `♻️ 自动测速`），支持可选中间跳板节点与多个出口落地节点；
-  - 编译时自动克隆出口节点并注入 `dialer-proxy`（原节点保持不动），生成独立 `select` / `url-test` 中转组，并可自动注入主选择策略组；
-  - 支持在弹窗中直接预览生成的 `dialer-proxy` YAML 片段。
-- **一键导出 & 本机 HTTP 订阅服务**：
-  - 支持导出 `.yaml` 文件或复制完整编译结果；
-  - 内置轻量级本机 HTTP 订阅服务（`http://127.0.0.1:18080/sub/<profileId>.yaml`），开启后可直接将链接粘贴进 ClashMetaForAndroid / FlClash 订阅。
+## 核心特性
 
-## 如何直接打包成 APK（无需本地安装 Android Studio）
+- **初次导入自动拆分**：支持从本地 `.yaml / .yml` 文件、远程链接或剪贴板导入配置，自动将单一大文件拆分为独立模块持久化保存：
+  - `base.yaml`（全局基础参数）
+  - `proxies.yaml` & `custom_proxies.yaml`（远端同步条目与本地自定义条目分离存储，无损保留扩展字段）
+  - `groups.yaml`（分组配置）
+  - `rules.json` & `rule_providers.yaml`（可开关、可调整优先级的匹配规则）
+- **远端增量更新**：刷新远端配置时仅更新远端来源条目，保留本地自定义条目、分组、规则及链路绑定参数。
+- **可视化分块编辑**：
+  - **条目管理**：支持按类型筛选、URI 快捷导入、基础字段编辑与原始 YAML 无损编辑；
+  - **链路绑定**：支持为目标条目直接绑定前置出口（`dialer-proxy`），不生成多余副本；
+  - **分组管理**：支持新建、编辑、排序与删除分组，内置分类 Emoji 快捷选择；
+  - **规则管理**：支持搜索、单条启停、上下调整优先级与目标分组绑定。
+- **导出与本机局域网同步**：支持导出编译后的完整 `.yaml` 文件、一键复制，或开启本机 HTTP 服务（`http://127.0.0.1:18080/sub/<profileId>.yaml`）供本地应用直接拉取。
 
-本项目已内置 GitHub Actions 工作流（`.github/workflows/build-apk.yml`）：
+## 云端自动构建 APK（GitHub Actions）
 
-1. 在 GitHub 新建一个仓库，将本压缩包解压后的全部文件一次性上传至 `main` 分支（建议通过 GitHub Web UI 或 `git push` 一次性提交，避免多次触发构建）。
-2. 打开仓库顶部的 **Actions** 页面，等待 **Build Android APK** 自动运行完成（会自动执行单元测试并编译 Debug APK）。
-3. 在构建详情页底部的 **Artifacts** 中下载 `ConfigBox-debug-apk`，解压安装即可。
+仓库已内置 `.github/workflows/build-apk.yml`：
 
-## 本地 Android Studio 构建
+1. 将项目文件推送至 `main` 分支后，自动触发单元测试与 Debug APK 编译。
+2. 在仓库 **Actions → Build Android APK** 完成后的 **Artifacts** 区域下载 `ConfigBox-debug-apk` 即可安装。
 
-1. 使用 Android Studio（Ladybug / 2024.2+，JDK 17）打开 `ConfigBox` 目录。
-2. 等待 Gradle Sync 完成。
-3. 运行 `./gradlew testDebugUnitTest` 验证核心引擎，或直接点击 Run / Build APK。
+## 本地构建
+
+1. 使用 Android Studio（2024.2+，JDK 17）打开项目根目录。
+2. 执行 `gradle testDebugUnitTest` 运行单元测试，或直接构建安装。
