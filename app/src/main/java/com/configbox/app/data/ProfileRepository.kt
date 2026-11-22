@@ -1,0 +1,185 @@
+package com.configbox.app.data
+
+import android.content.Context
+import com.configbox.app.engine.ConfigEngine
+import com.configbox.app.engine.YamlCodec
+import com.configbox.app.model.NodeSource
+import com.configbox.app.model.ProfileMeta
+import com.configbox.app.model.ProxyGroupEntry
+import com.configbox.app.model.ProxyNode
+import com.configbox.app.model.RelayGroup
+import com.configbox.app.model.RuleEntry
+import com.configbox.app.model.SplitProfile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * Persists each split Clash profile into its own modular directory:
+ *
+ *   filesDir/profiles/<profileId>/
+ *     ├── meta.json
+ *     ├── base.yaml
+ *     ├── proxies.yaml         (subscription nodes)
+ *     ├── custom_proxies.yaml  (user-added / custom nodes)
+ *     ├── groups.yaml
+ *     ├── rules.json
+ *     ├── rule_providers.yaml
+ *     └── relays.json          (dialer-proxy relay groups)
+ */
+class ProfileRepository(context: Context) {
+
+    private val profilesRoot = File(context.filesDir, "profiles").apply { mkdirs() }
+
+    private val json = Json {
+        prettyPrint = true
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
+
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    suspend fun listProfiles(): List<ProfileMeta> = withContext(Dispatchers.IO) {
+        profilesRoot.listFiles()
+            ?.filter { it.isDirectory }
+            ?.mapNotNull { dir ->
+                val metaFile = File(dir, "meta.json")
+                if (!metaFile.exists()) return@mapNotNull null
+                runCatching { json.decodeFromString<ProfileMeta>(metaFile.readText()) }.getOrNull()
+            }
+            ?.sortedByDescending { it.updatedAt }
+            ?: emptyList()
+    }
+
+    suspend fun loadProfile(profileId: String): SplitProfile? = withContext(Dispatchers.IO) {
+        val dir = File(profilesRoot, profileId)
+        val metaFile = File(dir, "meta.json")
+        if (!metaFile.exists()) return@withContext null
+
+        val meta = json.decodeFromString<ProfileMeta>(metaFile.readText())
+        val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
+        val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
+        val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
+        val groups = readGroupListFile(File(dir, "groups.yaml"))
+        val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
+            runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
+        } ?: emptyList()
+        val ruleProvidersYaml = File(dir, "rule_providers.yaml").takeIf { it.exists() }?.readText() ?: ""
+        val relays = File(dir, "relays.json").takeIf { it.exists() }?.let {
+            runCatching { json.decodeFromString<List<RelayGroup>>(it.readText()) }.getOrDefault(emptyList())
+        } ?: emptyList()
+
+        SplitProfile(
+            meta = meta.copy(
+                nodeCount = subProxies.size + customProxies.size,
+                groupCount = groups.size,
+                ruleCount = rules.size,
+                relayGroupCount = relays.size
+            ),
+            baseConfigYaml = baseYaml,
+            proxies = subProxies + customProxies,
+            proxyGroups = groups,
+            rules = rules,
+            ruleProvidersYaml = ruleProvidersYaml,
+            relayGroups = relays
+        )
+    }
+
+    suspend fun saveProfile(profile: SplitProfile): SplitProfile = withContext(Dispatchers.IO) {
+        val updatedMeta = profile.meta.copy(
+            updatedAt = System.currentTimeMillis(),
+            nodeCount = profile.proxies.size,
+            groupCount = profile.proxyGroups.size,
+            ruleCount = profile.rules.size,
+            relayGroupCount = profile.relayGroups.size
+        )
+        val updated = profile.copy(meta = updatedMeta)
+        val dir = File(profilesRoot, updatedMeta.id).apply { mkdirs() }
+
+        File(dir, "meta.json").writeText(json.encodeToString(updatedMeta))
+        File(dir, "base.yaml").writeText(updated.baseConfigYaml)
+
+        val subNodes = updated.proxies.filter { it.source == NodeSource.SUBSCRIPTION }
+        val customNodes = updated.proxies.filter { it.source == NodeSource.CUSTOM }
+        writeProxyListFile(File(dir, "proxies.yaml"), subNodes)
+        writeProxyListFile(File(dir, "custom_proxies.yaml"), customNodes)
+
+        writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
+        File(dir, "rules.json").writeText(json.encodeToString(updated.rules))
+        File(dir, "rule_providers.yaml").writeText(updated.ruleProvidersYaml)
+        File(dir, "relays.json").writeText(json.encodeToString(updated.relayGroups))
+
+        updated
+    }
+
+    suspend fun deleteProfile(profileId: String) = withContext(Dispatchers.IO) {
+        File(profilesRoot, profileId).deleteRecursively()
+    }
+
+    suspend fun fetchSubscriptionYaml(url: String): String = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(url.trim())
+            .header("User-Agent", "clash-verge/v2.0.0")
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("订阅拉取失败：HTTP ${response.code}")
+            }
+            val body = response.body?.string()
+            if (body.isNullOrBlank()) {
+                throw IllegalStateException("订阅返回内容为空")
+            }
+            body
+        }
+    }
+
+    private fun writeProxyListFile(file: File, nodes: List<ProxyNode>) {
+        val maps = nodes.map { YamlCodec.parseMap(it.rawYaml) }
+        file.writeText(YamlCodec.dump(linkedMapOf("proxies" to maps)))
+    }
+
+    private fun readProxyListFile(file: File, source: NodeSource): List<ProxyNode> {
+        if (!file.exists()) return emptyList()
+        val root = runCatching { YamlCodec.parseMap(file.readText()) }.getOrNull() ?: return emptyList()
+        val list = root["proxies"] as? List<*> ?: return emptyList()
+        return list.mapNotNull { item ->
+            val map = item as? Map<*, *> ?: return@mapNotNull null
+            val yamlStr = YamlCodec.dump(map)
+            runCatching { ConfigEngine.parseNodeFromYaml(yamlStr, source) }.getOrNull()
+        }
+    }
+
+    private fun writeGroupListFile(file: File, groups: List<ProxyGroupEntry>) {
+        val maps = groups.map { YamlCodec.parseMap(it.rawYaml) }
+        file.writeText(YamlCodec.dump(linkedMapOf("proxy-groups" to maps)))
+    }
+
+    private fun readGroupListFile(file: File): List<ProxyGroupEntry> {
+        if (!file.exists()) return emptyList()
+        val root = runCatching { YamlCodec.parseMap(file.readText()) }.getOrNull() ?: return emptyList()
+        val list = root["proxy-groups"] as? List<*> ?: return emptyList()
+        return list.mapNotNull { item ->
+            val map = item as? Map<*, *> ?: return@mapNotNull null
+            val name = map["name"]?.toString()?.trim() ?: return@mapNotNull null
+            val type = map["type"]?.toString()?.trim() ?: "select"
+            val proxies = (map["proxies"] as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
+            ProxyGroupEntry(
+                name = name,
+                type = type,
+                proxies = proxies,
+                url = map["url"]?.toString(),
+                interval = map["interval"]?.toString()?.toIntOrNull(),
+                rawYaml = YamlCodec.dump(map)
+            )
+        }
+    }
+}
