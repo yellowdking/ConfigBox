@@ -25,12 +25,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.DragIndicator
+import androidx.compose.material.icons.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -51,10 +55,12 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,9 +69,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.configbox.app.engine.LatencyResult
+import com.configbox.app.engine.NodeNetworkTools
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
+import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyNode
+import com.configbox.app.model.SplitProfile
 import com.configbox.app.ui.ConfigBoxUiState
 import com.configbox.app.ui.ConfigBoxViewModel
 import com.configbox.app.ui.components.draggedItemVisual
@@ -80,6 +90,7 @@ import com.configbox.app.ui.theme.SkyAccent
 import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 import com.configbox.app.ui.theme.SoftSurface
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -101,9 +112,19 @@ fun NodesScreen(
     var showAddNodeDialog by remember { mutableStateOf(false) }
     var showRelayBindDialog by remember { mutableStateOf(false) }
     var editingNode by remember { mutableStateOf<ProxyNode?>(null) }
+    var transferringNode by remember { mutableStateOf<ProxyNode?>(null) }
+    var showImportFromProfileDialog by remember { mutableStateOf(false) }
+    var showBatchDomainToIpConfirm by remember { mutableStateOf(false) }
     var showAddSubDialog by remember { mutableStateOf(false) }
     var editingSub by remember { mutableStateOf<NodeSubscription?>(null) }
     var deletingSub by remember { mutableStateOf<NodeSubscription?>(null) }
+
+    val otherProfiles = remember(uiState.profiles, active.meta.id) {
+        uiState.profiles.filter { it.id != active.meta.id }
+    }
+    val domainNodeCount = remember(active.proxies) {
+        active.proxies.count { !NodeNetworkTools.isIpAddress(it.server) }
+    }
 
     val subNameById = remember(active.nodeSubscriptions) {
         active.nodeSubscriptions.associate { it.id to it.name }
@@ -206,6 +227,50 @@ fun NodesScreen(
                                     )
                                 }
                             }
+                            Spacer(Modifier.height(6.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { viewModel.testAllNodesLatency(filteredNodes.map { it.id }) },
+                                    enabled = !uiState.isTestingAllLatencies && filteredNodes.isNotEmpty(),
+                                    border = BorderStroke(1.dp, BorderGray),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(Icons.Outlined.Speed, null, Modifier.size(15.dp), tint = SkyAccent)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        text = if (uiState.isTestingAllLatencies) "测速中..." else "一键测速",
+                                        fontSize = 12.sp,
+                                        color = SlateInk
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { showBatchDomainToIpConfirm = true },
+                                    enabled = !uiState.isLoading && domainNodeCount > 0,
+                                    border = BorderStroke(1.dp, BorderGray),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(Icons.Outlined.Dns, null, Modifier.size(15.dp), tint = EmeraldActive)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("域名转IP ($domainNodeCount)", fontSize = 12.sp, color = SlateInk)
+                                }
+                                if (otherProfiles.isNotEmpty()) {
+                                    OutlinedButton(
+                                        onClick = { showImportFromProfileDialog = true },
+                                        enabled = !uiState.isLoading,
+                                        border = BorderStroke(1.dp, BorderGray),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Outlined.SwapHoriz, null, Modifier.size(15.dp), tint = SkyAccent)
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("跨配置引入", fontSize = 12.sp, color = SlateInk)
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -229,7 +294,7 @@ fun NodesScreen(
                     ) {
                         item(key = "nodes_hint") {
                             Text(
-                                text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑" else "清除搜索和筛选后可长按拖动排序",
+                                text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑 · 点延迟标签测速" else "清除搜索和筛选后可长按拖动排序",
                                 style = MaterialTheme.typography.labelMedium
                             )
                         }
@@ -238,10 +303,15 @@ fun NodesScreen(
                             NodeCard(
                                 node = node,
                                 subscriptionName = node.subscriptionId?.let { subNameById[it] },
+                                latency = uiState.nodeLatencies[node.id],
+                                canTransfer = otherProfiles.isNotEmpty(),
                                 isDragging = isDragging,
                                 modifier = Modifier.draggedItemVisual(isDragging, nodeReorderState.dragOffsetY),
                                 showDragHandle = canDragReorder,
                                 onClick = { editingNode = node },
+                                onTestLatency = { viewModel.testNodeLatency(node.id) },
+                                onConvertDomainToIp = { viewModel.convertNodeDomainToIp(node.id) },
+                                onTransfer = { transferringNode = node },
                                 onDelete = { viewModel.deleteNode(node.id) }
                             )
                         }
@@ -473,10 +543,72 @@ fun NodesScreen(
         )
     }
 
+    if (showBatchDomainToIpConfirm) {
+        AlertDialog(
+            onDismissRequest = { showBatchDomainToIpConfirm = false },
+            containerColor = PureWhite,
+            title = { Text("批量域名转 IP") },
+            text = {
+                Text(
+                    text = "将当前配置中的 $domainNodeCount 个域名节点解析并替换为 IP 地址（优先 IPv4），同时自动保留原域名作为 TLS SNI / WebSocket Host，不影响原有加密握手。",
+                    fontSize = 13.sp,
+                    color = SlateInk
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                    onClick = {
+                        showBatchDomainToIpConfirm = false
+                        viewModel.convertAllDomainNodesToIp()
+                    }
+                ) {
+                    Text("开始转换")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchDomainToIpConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+
+    transferringNode?.let { node ->
+        TransferNodeDialog(
+            node = node,
+            otherProfiles = otherProfiles,
+            loadProfile = { viewModel.loadProfileForPicker(it) },
+            onDismiss = { transferringNode = null },
+            onConfirm = { targetProfileId, move, targetGroups ->
+                transferringNode = null
+                viewModel.transferNodeToProfile(node.id, targetProfileId, move, targetGroups)
+            }
+        )
+    }
+
+    if (showImportFromProfileDialog && otherProfiles.isNotEmpty()) {
+        ImportFromProfileDialog(
+            otherProfiles = otherProfiles,
+            currentGroupNames = groupNames,
+            loadProfile = { viewModel.loadProfileForPicker(it) },
+            onDismiss = { showImportFromProfileDialog = false },
+            onConfirm = { sourceId, nodeIds, targetGroups ->
+                showImportFromProfileDialog = false
+                viewModel.importNodesFromProfile(sourceId, nodeIds, targetGroups)
+            }
+        )
+    }
+
     editingNode?.let { node ->
         EditNodeDialog(
             node = node,
             entryCandidates = entryCandidates,
+            latency = uiState.nodeLatencies[node.id],
+            onTestLatency = { viewModel.testNodeLatency(node.id) },
+            onResolveDomain = { domain -> viewModel.resolveDomainCandidates(domain) },
+            onConvertToIp = { chosenIp ->
+                editingNode = null
+                viewModel.convertNodeDomainToIp(node.id, chosenIp)
+            },
             onDismiss = { editingNode = null },
             onSaveBasic = { name, server, port, udp, dialer ->
                 editingNode = null
@@ -846,12 +978,18 @@ private fun BindRelayDialog(
 private fun NodeCard(
     node: ProxyNode,
     subscriptionName: String?,
+    latency: LatencyResult?,
+    canTransfer: Boolean,
     isDragging: Boolean,
     showDragHandle: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
+    onTestLatency: () -> Unit,
+    onConvertDomainToIp: () -> Unit,
+    onTransfer: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val isDomain = remember(node.server) { !NodeNetworkTools.isIpAddress(node.server) }
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -895,21 +1033,86 @@ private fun NodeCard(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "${node.server}:${node.port}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                    color = SlateMuted
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "${node.server}:${node.port}",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        color = SlateMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    LatencyChip(latency = latency, onClick = onTestLatency)
+                    if (isDomain) {
+                        Surface(
+                            color = EmeraldActive.copy(alpha = 0.1f),
+                            shape = MaterialTheme.shapes.extraSmall,
+                            modifier = Modifier.clickable { onConvertDomainToIp() }
+                        ) {
+                            Text(
+                                text = "转IP",
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = EmeraldActive
+                            )
+                        }
+                    }
+                }
                 if (!node.dialerProxy.isNullOrBlank()) {
                     Spacer(Modifier.height(4.dp))
                     BadgeTag("dialer-proxy: ${node.dialerProxy}", AmberBadge)
+                }
+            }
+            if (canTransfer) {
+                IconButton(onClick = onTransfer, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Outlined.DriveFileMove, contentDescription = "复制/移动到其他配置", tint = SkyAccent, modifier = Modifier.size(18.dp))
                 }
             }
             IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
                 Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除节点", tint = RoseDanger, modifier = Modifier.size(18.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun LatencyChip(
+    latency: LatencyResult?,
+    onClick: () -> Unit
+) {
+    val (label, color) = when {
+        latency == null -> "测速" to SlateMuted
+        latency.testing -> "测速中..." to SkyAccent
+        latency.latencyMs != null -> {
+            val ms = latency.latencyMs
+            val c = when {
+                ms < 150 -> EmeraldActive
+                ms < 400 -> AmberBadge
+                else -> RoseDanger
+            }
+            "${ms}ms" to c
+        }
+        else -> (latency.error ?: "失败") to RoseDanger
+    }
+    Surface(
+        color = color.copy(alpha = 0.12f),
+        shape = MaterialTheme.shapes.extraSmall,
+        modifier = Modifier.clickable { onClick() }
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = color
+        )
     }
 }
 
@@ -1080,10 +1283,15 @@ private fun AddNodeDialog(
 private fun EditNodeDialog(
     node: ProxyNode,
     entryCandidates: List<String>,
+    latency: LatencyResult?,
+    onTestLatency: () -> Unit,
+    onResolveDomain: suspend (String) -> Result<List<String>>,
+    onConvertToIp: (String) -> Unit,
     onDismiss: () -> Unit,
     onSaveBasic: (name: String, server: String, port: Int, udp: Boolean, dialerProxy: String?) -> Unit,
     onSaveRawYaml: (String) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     var tab by remember { mutableIntStateOf(0) }
     var name by remember { mutableStateOf(node.name) }
     var server by remember { mutableStateOf(node.server) }
@@ -1091,11 +1299,25 @@ private fun EditNodeDialog(
     var udp by remember { mutableStateOf(node.udp) }
     var dialerProxy by remember { mutableStateOf(node.dialerProxy.orEmpty()) }
     var rawYaml by remember { mutableStateOf(node.rawYaml) }
+    var resolvingIps by remember { mutableStateOf(false) }
+    var resolvedIps by remember { mutableStateOf<List<String>>(emptyList()) }
+    var resolveError by remember { mutableStateOf<String?>(null) }
+
+    val serverIsDomain = remember(server) { server.isNotBlank() && !NodeNetworkTools.isIpAddress(server) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PureWhite,
-        title = { Text("编辑节点") },
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("编辑节点")
+                LatencyChip(latency = latency, onClick = onTestLatency)
+            }
+        },
         text = {
             Column {
                 TabRow(selectedTabIndex = tab, containerColor = PureWhite) {
@@ -1118,7 +1340,11 @@ private fun EditNodeDialog(
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedTextField(
                                 value = server,
-                                onValueChange = { server = it },
+                                onValueChange = {
+                                    server = it
+                                    resolvedIps = emptyList()
+                                    resolveError = null
+                                },
                                 label = { Text("服务器地址") },
                                 singleLine = true,
                                 modifier = Modifier.weight(2f)
@@ -1130,6 +1356,55 @@ private fun EditNodeDialog(
                                 singleLine = true,
                                 modifier = Modifier.weight(1f)
                             )
+                        }
+                        if (serverIsDomain) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "检测到域名地址，可解析为 IP（自动保留 SNI）",
+                                    fontSize = 11.sp,
+                                    color = SlateMuted,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(
+                                    enabled = !resolvingIps,
+                                    onClick = {
+                                        resolvingIps = true
+                                        resolveError = null
+                                        scope.launch {
+                                            onResolveDomain(server)
+                                                .onSuccess { ips -> resolvedIps = ips }
+                                                .onFailure { err -> resolveError = err.message ?: "解析失败" }
+                                            resolvingIps = false
+                                        }
+                                    }
+                                ) {
+                                    Text(if (resolvingIps) "解析中..." else "解析域名", fontSize = 12.sp)
+                                }
+                            }
+                            if (resolveError != null) {
+                                Text(resolveError!!, fontSize = 11.sp, color = RoseDanger)
+                            }
+                            if (resolvedIps.isNotEmpty()) {
+                                Text("点击下方 IP 立即替换（保留原域名 SNI）：", fontSize = 11.sp, color = EmeraldActive)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    resolvedIps.forEach { ip ->
+                                        FilterChip(
+                                            selected = false,
+                                            onClick = { onConvertToIp(ip) },
+                                            label = { Text(ip, fontFamily = FontFamily.Monospace, fontSize = 11.sp) }
+                                        )
+                                    }
+                                }
+                            }
                         }
                         Text("快捷选择入口前置 (dialer-proxy)", style = MaterialTheme.typography.labelMedium)
                         Row(
@@ -1198,6 +1473,287 @@ private fun EditNodeDialog(
                 }
             ) {
                 Text("保存")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun TransferNodeDialog(
+    node: ProxyNode,
+    otherProfiles: List<ProfileMeta>,
+    loadProfile: suspend (String) -> SplitProfile?,
+    onDismiss: () -> Unit,
+    onConfirm: (targetProfileId: String, move: Boolean, targetGroups: List<String>) -> Unit
+) {
+    var selectedTargetId by remember { mutableStateOf(otherProfiles.firstOrNull()?.id.orEmpty()) }
+    var moveMode by remember { mutableStateOf(false) } // false = 复制, true = 移动
+    var targetProfile by remember { mutableStateOf<SplitProfile?>(null) }
+    var selectedGroups by remember { mutableStateOf(setOf<String>()) }
+
+    LaunchedEffect(selectedTargetId) {
+        selectedGroups = emptySet()
+        targetProfile = if (selectedTargetId.isNotBlank()) loadProfile(selectedTargetId) else null
+    }
+
+    val targetGroupNames = targetProfile?.proxyGroups?.map { it.name }.orEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("跨配置调整节点") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "当前节点：${node.name}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SlateInk
+                )
+                Text("1. 操作方式", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !moveMode,
+                        onClick = { moveMode = false },
+                        label = { Text("复制到目标配置", fontSize = 12.sp) }
+                    )
+                    FilterChip(
+                        selected = moveMode,
+                        onClick = { moveMode = true },
+                        label = { Text("移动到目标配置", fontSize = 12.sp) }
+                    )
+                }
+                Text("2. 选择目标配置文件", style = MaterialTheme.typography.labelMedium)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    otherProfiles.forEach { profile ->
+                        val isSelected = profile.id == selectedTargetId
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedTargetId = profile.id },
+                            color = if (isSelected) SkyAccent.copy(alpha = 0.1f) else SoftSurface,
+                            border = BorderStroke(1.dp, if (isSelected) SkyAccent else BorderGray),
+                            shape = MaterialTheme.shapes.small
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = profile.name,
+                                    fontSize = 13.sp,
+                                    color = if (isSelected) SkyAccent else SlateInk,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = "${profile.nodeCount} 节点",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = SlateMuted
+                                )
+                            }
+                        }
+                    }
+                }
+                if (targetGroupNames.isNotEmpty()) {
+                    Text("3. 自动加入目标配置的策略组（可选）", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        targetGroupNames.forEach { groupName ->
+                            val isSelected = groupName in selectedGroups
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    selectedGroups = if (isSelected) selectedGroups - groupName else selectedGroups + groupName
+                                },
+                                label = { Text(groupName, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                enabled = selectedTargetId.isNotBlank(),
+                onClick = {
+                    onConfirm(
+                        selectedTargetId,
+                        moveMode,
+                        targetGroupNames.filter { it in selectedGroups }
+                    )
+                }
+            ) {
+                Text(if (moveMode) "移动过去" else "复制过去")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun ImportFromProfileDialog(
+    otherProfiles: List<ProfileMeta>,
+    currentGroupNames: List<String>,
+    loadProfile: suspend (String) -> SplitProfile?,
+    onDismiss: () -> Unit,
+    onConfirm: (sourceProfileId: String, nodeIds: Set<String>, targetGroups: List<String>) -> Unit
+) {
+    var selectedSourceId by remember { mutableStateOf(otherProfiles.firstOrNull()?.id.orEmpty()) }
+    var sourceProfile by remember { mutableStateOf<SplitProfile?>(null) }
+    var selectedNodeIds by remember { mutableStateOf(setOf<String>()) }
+    var selectedGroups by remember { mutableStateOf(setOf<String>()) }
+
+    LaunchedEffect(selectedSourceId) {
+        selectedNodeIds = emptySet()
+        sourceProfile = if (selectedSourceId.isNotBlank()) loadProfile(selectedSourceId) else null
+    }
+
+    val sourceNodes = sourceProfile?.proxies.orEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("从其他配置引入节点") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("1. 选择来源配置", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    otherProfiles.forEach { profile ->
+                        FilterChip(
+                            selected = profile.id == selectedSourceId,
+                            onClick = { selectedSourceId = profile.id },
+                            label = { Text(profile.name, fontSize = 12.sp) }
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("2. 勾选要引入的节点 (${selectedNodeIds.size}/${sourceNodes.size})", style = MaterialTheme.typography.labelMedium)
+                    if (sourceNodes.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                selectedNodeIds = if (selectedNodeIds.size == sourceNodes.size) {
+                                    emptySet()
+                                } else {
+                                    sourceNodes.map { it.id }.toSet()
+                                }
+                            }
+                        ) {
+                            Text(if (selectedNodeIds.size == sourceNodes.size) "全不选" else "全选", fontSize = 11.sp)
+                        }
+                    }
+                }
+
+                if (sourceNodes.isEmpty()) {
+                    Text("该配置暂无节点", fontSize = 12.sp, color = SlateMuted)
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        sourceNodes.forEach { node ->
+                            val isSelected = node.id in selectedNodeIds
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedNodeIds = if (isSelected) selectedNodeIds - node.id else selectedNodeIds + node.id
+                                    },
+                                color = if (isSelected) EmeraldActive.copy(alpha = 0.1f) else SoftSurface,
+                                border = BorderStroke(1.dp, if (isSelected) EmeraldActive else BorderGray),
+                                shape = MaterialTheme.shapes.small
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = node.name,
+                                            fontSize = 12.sp,
+                                            color = if (isSelected) EmeraldActive else SlateInk,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "${node.server}:${node.port}",
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 10.sp,
+                                            color = SlateMuted,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Text(
+                                        text = node.type.uppercase(),
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.sp,
+                                        color = SlateMuted
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (currentGroupNames.isNotEmpty()) {
+                    Text("3. 引入后自动加入当前配置的策略组（可选）", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        currentGroupNames.forEach { g ->
+                            val isSelected = g in selectedGroups
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    selectedGroups = if (isSelected) selectedGroups - g else selectedGroups + g
+                                },
+                                label = { Text(g, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                enabled = selectedSourceId.isNotBlank() && selectedNodeIds.isNotEmpty(),
+                onClick = {
+                    onConfirm(
+                        selectedSourceId,
+                        selectedNodeIds,
+                        currentGroupNames.filter { it in selectedGroups }
+                    )
+                }
+            ) {
+                Text("引入 (${selectedNodeIds.size})")
             }
         },
         dismissButton = {

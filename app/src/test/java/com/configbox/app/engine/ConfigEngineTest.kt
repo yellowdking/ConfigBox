@@ -277,4 +277,49 @@ class ConfigEngineTest {
         val split = ConfigEngine.splitConfig(yaml, "去重测试")
         assertEquals(listOf("HK 01", "HK 01 (2)"), split.proxies.map { it.name })
     }
+
+    @Test
+    fun replaceNodeServerWithIpPreservesTlsSniAndWsHost() {
+        val vlessWs = ProxyUriParser.parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@cdn.example.com:443?security=tls&type=ws&path=%2Fws#VLESS WS"
+        )
+        val convertedVless = ConfigEngine.replaceNodeServerWithIp(vlessWs, "203.0.113.42")
+        assertEquals("203.0.113.42", convertedVless.server)
+        val vlessMap = YamlCodec.parseMap(convertedVless.rawYaml)
+        assertEquals("203.0.113.42", vlessMap["server"])
+        assertEquals("cdn.example.com", vlessMap["servername"])
+        @Suppress("UNCHECKED_CAST")
+        val wsOpts = vlessMap["ws-opts"] as Map<String, Any?>
+        @Suppress("UNCHECKED_CAST")
+        val headers = wsOpts["headers"] as Map<String, Any?>
+        assertEquals("cdn.example.com", headers["Host"])
+
+        // Existing explicit SNI must NOT be overwritten
+        val trojanWithSni = ProxyUriParser.parse(
+            "trojan://secret@edge.example.com:443?sni=real-sni.example.com#Trojan Custom SNI"
+        )
+        val convertedTrojan = ConfigEngine.replaceNodeServerWithIp(trojanWithSni, "198.51.100.88")
+        val trojanMap = YamlCodec.parseMap(convertedTrojan.rawYaml)
+        assertEquals("198.51.100.88", trojanMap["server"])
+        assertEquals("real-sni.example.com", trojanMap["sni"])
+    }
+
+    @Test
+    fun copyNodeToProfileDeduplicatesAndAddsToSelectedGroups() {
+        val source = ConfigEngine.splitConfig(ConfigEngine.SAMPLE_CLASH_YAML, "来源配置")
+        val target = ConfigEngine.splitConfig(ConfigEngine.SAMPLE_CLASH_YAML, "目标配置")
+        val hkNode = source.proxies.first { it.name == "香港 IPLC 01" }
+
+        val (updatedTarget, copied) = ConfigEngine.copyNodeToProfile(
+            targetProfile = target,
+            node = hkNode,
+            targetGroups = listOf("🚀 节点选择")
+        )
+        assertEquals("香港 IPLC 01 (2)", copied.name)
+        assertEquals(NodeSource.CUSTOM, copied.source)
+        assertNull(copied.subscriptionId)
+        assertEquals(target.proxies.size + 1, updatedTarget.proxies.size)
+        val selectGroup = updatedTarget.proxyGroups.first { it.name == "🚀 节点选择" }
+        assertTrue("香港 IPLC 01 (2)" in selectGroup.proxies)
+    }
 }

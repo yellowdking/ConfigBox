@@ -5,6 +5,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.configbox.app.data.ProfileRepository
 import com.configbox.app.engine.ConfigEngine
+import com.configbox.app.engine.LatencyResult
+import com.configbox.app.engine.NodeNetworkTools
 import com.configbox.app.engine.ProxyUriParser
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
@@ -14,13 +16,18 @@ import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
 import com.configbox.app.server.LocalSubServer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -29,6 +36,8 @@ data class ConfigBoxUiState(
     val activeProfile: SplitProfile? = null,
     val compiledYaml: String = "",
     val isLoading: Boolean = false,
+    val isTestingAllLatencies: Boolean = false,
+    val nodeLatencies: Map<String, LatencyResult> = emptyMap(),
     val serverRunning: Boolean = false,
     val serverPort: Int = 18080,
     val snackbarMessage: String? = null
@@ -103,6 +112,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     it.copy(
                         activeProfile = loaded,
                         compiledYaml = compiled,
+                        nodeLatencies = emptyMap(),
                         isLoading = false
                     )
                 }
@@ -400,6 +410,290 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             "已删除订阅「${sub.name}」，节点已保留为自定义节点"
         }
         mutateActiveProfile(updated, msg)
+    }
+
+    // --- Node Latency Testing, Domain-to-IP & Cross-Profile Transfer ---
+
+    fun testNodeLatency(nodeId: String) {
+        val node = _uiState.value.activeProfile?.proxies?.firstOrNull { it.id == nodeId } ?: return
+        viewModelScope.launch {
+            _uiState.update { state ->
+                state.copy(nodeLatencies = state.nodeLatencies + (nodeId to LatencyResult(testing = true)))
+            }
+            val result = NodeNetworkTools.testTcpLatency(node.server, node.port)
+            _uiState.update { state ->
+                state.copy(nodeLatencies = state.nodeLatencies + (nodeId to result))
+            }
+        }
+    }
+
+    fun testAllNodesLatency(nodeIds: List<String>? = null) {
+        val profile = _uiState.value.activeProfile ?: return
+        val targets = if (nodeIds == null) {
+            profile.proxies
+        } else {
+            val idSet = nodeIds.toSet()
+            profile.proxies.filter { it.id in idSet }
+        }
+        if (targets.isEmpty()) return
+
+        viewModelScope.launch {
+            _uiState.update { state ->
+                val marking = targets.associate { it.id to LatencyResult(testing = true) }
+                state.copy(
+                    isTestingAllLatencies = true,
+                    nodeLatencies = state.nodeLatencies + marking
+                )
+            }
+            val semaphore = Semaphore(8)
+            val results = coroutineScope {
+                targets.map { node ->
+                    async {
+                        semaphore.withPermit {
+                            val res = NodeNetworkTools.testTcpLatency(node.server, node.port)
+                            _uiState.update { state ->
+                                state.copy(nodeLatencies = state.nodeLatencies + (node.id to res))
+                            }
+                            res
+                        }
+                    }
+                }.awaitAll()
+            }
+            val okCount = results.count { it.latencyMs != null }
+            val failCount = results.size - okCount
+            _uiState.update {
+                it.copy(
+                    isTestingAllLatencies = false,
+                    snackbarMessage = "延迟测试完成：$okCount 个可达，$failCount 个超时/不可达"
+                )
+            }
+        }
+    }
+
+    suspend fun resolveDomainCandidates(domain: String): Result<List<String>> =
+        runCatching { NodeNetworkTools.resolveDomainIps(domain) }
+
+    fun convertNodeDomainToIp(nodeId: String, chosenIp: String? = null) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val profile = _uiState.value.activeProfile ?: return@withLock
+                val target = profile.proxies.firstOrNull { it.id == nodeId } ?: return@withLock
+                if (chosenIp == null && NodeNetworkTools.isIpAddress(target.server)) {
+                    postMessage("节点「${target.name}」已经是 IP 地址：${target.server}")
+                    return@withLock
+                }
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val ip = chosenIp?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: NodeNetworkTools.resolveDomainIps(target.server).first()
+                    val updatedNode = ConfigEngine.replaceNodeServerWithIp(target, ip)
+                    val updatedProxies = profile.proxies.map { if (it.id == nodeId) updatedNode else it }
+                    val saved = repository.saveProfile(profile.copy(proxies = updatedProxies))
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已将「${target.name}」转为 IP：$ip（已自动保留原域名 SNI）"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "域名转 IP 失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun convertAllDomainNodesToIp() {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val profile = _uiState.value.activeProfile ?: return@withLock
+                val domainNodes = profile.proxies.filter { !NodeNetworkTools.isIpAddress(it.server) }
+                if (domainNodes.isEmpty()) {
+                    postMessage("当前配置中所有节点均已是 IP 地址")
+                    return@withLock
+                }
+                _uiState.update { it.copy(isLoading = true) }
+                val semaphore = Semaphore(8)
+                val resolvedById = coroutineScope {
+                    domainNodes.map { node ->
+                        async {
+                            semaphore.withPermit {
+                                val ip = runCatching { NodeNetworkTools.resolveDomainIps(node.server).first() }.getOrNull()
+                                node.id to ip
+                            }
+                        }
+                    }.awaitAll().toMap()
+                }
+                var converted = 0
+                var failed = 0
+                val updatedProxies = profile.proxies.map { node ->
+                    if (node.id in resolvedById) {
+                        val ip = resolvedById[node.id]
+                        if (ip != null) {
+                            converted++
+                            ConfigEngine.replaceNodeServerWithIp(node, ip)
+                        } else {
+                            failed++
+                            node
+                        }
+                    } else {
+                        node
+                    }
+                }
+                val skipped = profile.proxies.size - domainNodes.size
+                runCatching {
+                    val saved = repository.saveProfile(profile.copy(proxies = updatedProxies))
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    val failNote = if (failed > 0) "，$failed 个解析失败" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "批量域名转 IP 完成：成功 $converted 个（跳过 $skipped 个 IP$failNote，已保留 SNI）"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "保存失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun loadProfileForPicker(profileId: String): SplitProfile? =
+        runCatching { repository.loadProfile(profileId) }.getOrNull()
+
+    fun transferNodeToProfile(
+        nodeId: String,
+        targetProfileId: String,
+        move: Boolean,
+        targetGroups: List<String> = emptyList()
+    ) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val active = _uiState.value.activeProfile ?: return@withLock
+                if (active.meta.id == targetProfileId) {
+                    postMessage("目标配置不能与当前配置相同")
+                    return@withLock
+                }
+                val node = active.proxies.firstOrNull { it.id == nodeId } ?: return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val target = repository.loadProfile(targetProfileId)
+                        ?: throw IllegalStateException("目标配置不存在")
+                    val (updatedTarget, copiedNode) = withContext(Dispatchers.Default) {
+                        ConfigEngine.copyNodeToProfile(target, node, targetGroups)
+                    }
+                    repository.saveProfile(updatedTarget)
+
+                    var nextActive = active
+                    if (move) {
+                        val remainingProxies = active.proxies
+                            .filterNot { it.id == nodeId }
+                            .map { n ->
+                                if (n.dialerProxy == node.name) {
+                                    ConfigEngine.updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, null)
+                                } else {
+                                    n
+                                }
+                            }
+                        val cleanedGroups = removeMemberFromGroups(active.proxyGroups, node.name)
+                        val updatedSubs = if (node.subscriptionId != null) {
+                            active.nodeSubscriptions.map { sub ->
+                                if (sub.id == node.subscriptionId) {
+                                    sub.copy(nodeCount = remainingProxies.count { it.subscriptionId == sub.id })
+                                } else {
+                                    sub
+                                }
+                            }
+                        } else {
+                            active.nodeSubscriptions
+                        }
+                        nextActive = repository.saveProfile(
+                            active.copy(
+                                proxies = remainingProxies,
+                                proxyGroups = cleanedGroups,
+                                nodeSubscriptions = updatedSubs
+                            )
+                        )
+                    }
+
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(nextActive) }
+                    val actionText = if (move) "移动" else "复制"
+                    val groupNote = if (targetGroups.isNotEmpty()) "（并加入 ${targetGroups.size} 个策略组）" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = nextActive,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已将节点「${copiedNode.name}」${actionText}到「${updatedTarget.meta.name}」$groupNote"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "跨配置转移失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun importNodesFromProfile(
+        sourceProfileId: String,
+        nodeIds: Set<String>,
+        targetGroups: List<String> = emptyList()
+    ) {
+        if (nodeIds.isEmpty()) return
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val active = _uiState.value.activeProfile ?: return@withLock
+                if (active.meta.id == sourceProfileId) return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val source = repository.loadProfile(sourceProfileId)
+                        ?: throw IllegalStateException("来源配置不存在")
+                    val selected = source.proxies.filter { it.id in nodeIds }
+                    if (selected.isEmpty()) throw IllegalArgumentException("未选择有效节点")
+
+                    var current = active
+                    for (node in selected.reversed()) {
+                        val (updated, _) = withContext(Dispatchers.Default) {
+                            ConfigEngine.copyNodeToProfile(current, node, targetGroups)
+                        }
+                        current = updated
+                    }
+                    val saved = repository.saveProfile(current)
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    val groupNote = if (targetGroups.isNotEmpty()) "，并加入 ${targetGroups.size} 个策略组" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已从「${source.meta.name}」引入 ${selected.size} 个节点$groupNote"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "引入节点失败：${err.message}")
+                    }
+                }
+            }
+        }
     }
 
     // --- Node & Direct `dialer-proxy` Operations ---

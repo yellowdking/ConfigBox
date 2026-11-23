@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build ConfigBox APK
 
 on:
   push:
@@ -30,20 +30,30 @@ jobs:
           gradle-version: '8.7'
 
       - name: Run unit tests
-        run: gradle testDebugUnitTest
+        run: gradle testReleaseUnitTest
 
-      - name: Build Debug APK
-        run: gradle assembleDebug
+      - name: Build ConfigBox Release APK
+        run: gradle assembleRelease
 
-      - name: Upload APK artifact
+      - name: Prepare ConfigBox APK naming
+        run: |
+          mkdir -p dist
+          APK_SRC=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          cp "$APK_SRC" dist/ConfigBox.apk
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            cp "$APK_SRC" "dist/ConfigBox-${GITHUB_REF_NAME}.apk"
+          fi
+          ls -lh dist/
+
+      - name: Upload ConfigBox APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ConfigBox-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: ConfigBox
+          path: dist/ConfigBox.apk
 
       - name: Publish GitHub Release on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/debug/app-debug.apk
+          files: dist/ConfigBox-${{ github.ref_name }}.apk
           generate_release_notes: true

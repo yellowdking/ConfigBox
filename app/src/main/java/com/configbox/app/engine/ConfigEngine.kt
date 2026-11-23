@@ -764,6 +764,123 @@ object ConfigEngine {
         )
     }
 
+    /**
+     * Replaces a node's domain [ProxyNode.server] with [resolvedIp] while preserving the
+     * original domain in TLS SNI (`sni` / `servername`) and WebSocket `Host` headers if unset,
+     * so TLS/CDN handshakes continue working seamlessly after domain-to-IP conversion.
+     */
+    fun replaceNodeServerWithIp(node: ProxyNode, resolvedIp: String): ProxyNode {
+        val cleanIp = resolvedIp.trim().removePrefix("[").removeSuffix("]")
+        require(cleanIp.isNotEmpty()) { "目标 IP 不能为空" }
+        val oldServer = node.server.trim()
+        val wasDomain = oldServer.isNotEmpty() && !NodeNetworkTools.isIpAddress(oldServer)
+
+        val map = YamlCodec.parseMap(node.rawYaml)
+        map["server"] = cleanIp
+
+        if (wasDomain) {
+            val typeLower = node.type.lowercase()
+            val tlsEnabled = map["tls"]?.toString()?.toBooleanStrictOrNull() == true || map["reality-opts"] != null
+            when (typeLower) {
+                "trojan", "hysteria2", "hysteria", "tuic", "anytls" -> {
+                    val existingSni = map["sni"]?.toString()?.trim()
+                    if (existingSni.isNullOrEmpty()) {
+                        map["sni"] = oldServer
+                    }
+                }
+                "vless", "vmess" -> {
+                    if (tlsEnabled) {
+                        val existingServerName = map["servername"]?.toString()?.trim()
+                        val existingSni = map["sni"]?.toString()?.trim()
+                        if (existingServerName.isNullOrEmpty() && existingSni.isNullOrEmpty()) {
+                            map["servername"] = oldServer
+                        }
+                    }
+                }
+            }
+            if (map["network"]?.toString()?.equals("ws", ignoreCase = true) == true) {
+                @Suppress("UNCHECKED_CAST")
+                val wsOpts = (map["ws-opts"] as? MutableMap<String, Any?>)
+                    ?: linkedMapOf<String, Any?>().also { map["ws-opts"] = it }
+                @Suppress("UNCHECKED_CAST")
+                val headers = (wsOpts["headers"] as? MutableMap<String, Any?>)
+                    ?: linkedMapOf<String, Any?>().also { wsOpts["headers"] = it }
+                val hasHost = headers.keys.any { it.equals("Host", ignoreCase = true) }
+                if (!hasHost) {
+                    headers["Host"] = oldServer
+                }
+            }
+        }
+
+        return node.copy(
+            server = cleanIp,
+            rawYaml = YamlCodec.dump(map)
+        )
+    }
+
+    /**
+     * Copies [node] into [targetProfile] as a standalone [NodeSource.CUSTOM] node with
+     * automatic name deduplication and optional insertion into [targetGroups].
+     */
+    fun copyNodeToProfile(
+        targetProfile: SplitProfile,
+        node: ProxyNode,
+        targetGroups: List<String> = emptyList()
+    ): Pair<SplitProfile, ProxyNode> {
+        val validTargetEntries = targetProfile.proxyGroups.map { it.name }.toSet() +
+            targetProfile.proxies.map { it.name }.toSet()
+        val preservedDialer = node.dialerProxy?.takeIf { it in validTargetEntries && it != node.name }
+        val baseCopy = updateNodeBasicFields(
+            node = node.copy(
+                id = UUID.randomUUID().toString().take(8),
+                source = NodeSource.CUSTOM,
+                subscriptionId = null
+            ),
+            newName = node.name,
+            newServer = node.server,
+            newPort = node.port,
+            newUdp = node.udp,
+            newDialerProxy = preservedDialer
+        )
+        val existingNames = targetProfile.proxies.map { it.name }.toSet()
+        val uniqueNode = ensureUniqueNodeName(baseCopy, existingNames)
+        val newProxies = listOf(uniqueNode) + targetProfile.proxies
+
+        val groupSet = targetGroups.toSet()
+        val updatedGroups = if (groupSet.isEmpty()) {
+            targetProfile.proxyGroups
+        } else {
+            targetProfile.proxyGroups.map { group ->
+                if (group.name in groupSet && uniqueNode.name !in group.proxies) {
+                    buildProxyGroup(
+                        id = group.id,
+                        name = group.name,
+                        type = group.type,
+                        proxies = group.proxies + uniqueNode.name,
+                        url = group.url,
+                        interval = group.interval,
+                        existingRawYaml = group.rawYaml
+                    )
+                } else {
+                    group
+                }
+            }
+        }
+
+        val updatedTarget = targetProfile.copy(
+            proxies = newProxies,
+            proxyGroups = updatedGroups,
+            meta = targetProfile.meta.copy(
+                updatedAt = System.currentTimeMillis(),
+                nodeCount = newProxies.size,
+                groupCount = updatedGroups.size,
+                relayBoundCount = newProxies.count { !it.dialerProxy.isNullOrBlank() },
+                subscriptionCount = targetProfile.nodeSubscriptions.size
+            )
+        )
+        return updatedTarget to uniqueNode
+    }
+
     private fun mapToProxyNode(
         map: Map<*, *>,
         source: NodeSource,
