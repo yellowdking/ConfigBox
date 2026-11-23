@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 data class ConfigBoxUiState(
@@ -33,6 +35,7 @@ data class ConfigBoxUiState(
 class ConfigBoxViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = ProfileRepository(application)
+    private val mutationMutex = Mutex()
 
     private val localServer = LocalSubServer(port = 18080) { profileId ->
         val profile = repository.loadProfile(profileId) ?: return@LocalSubServer null
@@ -63,19 +66,25 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun loadAllProfiles() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            val list = repository.listProfiles()
-            val currentId = _uiState.value.activeProfile?.meta?.id ?: list.firstOrNull()?.id
-            val loaded = currentId?.let { repository.loadProfile(it) }
-            val compiled = loaded?.let {
-                withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
-            }.orEmpty()
-            _uiState.update {
-                it.copy(
-                    profiles = list,
-                    activeProfile = loaded,
-                    compiledYaml = compiled,
-                    isLoading = false
-                )
+            runCatching {
+                val list = repository.listProfiles()
+                val currentId = _uiState.value.activeProfile?.meta?.id ?: list.firstOrNull()?.id
+                val loaded = currentId?.let { repository.loadProfile(it) }
+                val compiled = loaded?.let {
+                    withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
+                }.orEmpty()
+                _uiState.update {
+                    it.copy(
+                        profiles = list,
+                        activeProfile = loaded,
+                        compiledYaml = compiled,
+                        isLoading = false
+                    )
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(isLoading = false, snackbarMessage = "加载配置失败：${err.message}")
+                }
             }
         }
     }
@@ -83,16 +92,22 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun selectProfile(profileId: String) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            val loaded = repository.loadProfile(profileId)
-            val compiled = loaded?.let {
-                withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
-            }.orEmpty()
-            _uiState.update {
-                it.copy(
-                    activeProfile = loaded,
-                    compiledYaml = compiled,
-                    isLoading = false
-                )
+            runCatching {
+                val loaded = repository.loadProfile(profileId)
+                val compiled = loaded?.let {
+                    withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
+                }.orEmpty()
+                _uiState.update {
+                    it.copy(
+                        activeProfile = loaded,
+                        compiledYaml = compiled,
+                        isLoading = false
+                    )
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(isLoading = false, snackbarMessage = "切换配置失败：${err.message}")
+                }
             }
         }
     }
@@ -203,23 +218,27 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteProfile(profileId: String) {
         viewModelScope.launch {
-            repository.deleteProfile(profileId)
-            val list = repository.listProfiles()
-            val next = if (_uiState.value.activeProfile?.meta?.id == profileId) {
-                list.firstOrNull()?.let { repository.loadProfile(it.id) }
-            } else {
-                _uiState.value.activeProfile
-            }
-            val compiled = next?.let {
-                withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
-            }.orEmpty()
-            _uiState.update {
-                it.copy(
-                    profiles = list,
-                    activeProfile = next,
-                    compiledYaml = compiled,
-                    snackbarMessage = "已删除配置"
-                )
+            runCatching {
+                repository.deleteProfile(profileId)
+                val list = repository.listProfiles()
+                val next = if (_uiState.value.activeProfile?.meta?.id == profileId) {
+                    list.firstOrNull()?.let { repository.loadProfile(it.id) }
+                } else {
+                    _uiState.value.activeProfile
+                }
+                val compiled = next?.let {
+                    withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
+                }.orEmpty()
+                _uiState.update {
+                    it.copy(
+                        profiles = list,
+                        activeProfile = next,
+                        compiledYaml = compiled,
+                        snackbarMessage = "已删除配置"
+                    )
+                }
+            }.onFailure { err ->
+                postMessage("删除失败：${err.message}")
             }
         }
     }
@@ -229,8 +248,20 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun addNodeFromUri(uriText: String) {
         val profile = _uiState.value.activeProfile ?: return
         runCatching {
-            val node = ProxyUriParser.parse(uriText)
-            mutateActiveProfile(profile.copy(proxies = listOf(node) + profile.proxies), "已添加节点：${node.name}")
+            val parsedList = ProxyUriParser.parseBatch(uriText)
+            if (parsedList.isEmpty()) throw IllegalArgumentException("请输入至少一条有效的节点 URI")
+            val existingNames = profile.proxies.map { it.name }.toMutableSet()
+            val deduped = parsedList.map { candidate ->
+                val unique = ConfigEngine.ensureUniqueNodeName(candidate, existingNames)
+                existingNames.add(unique.name)
+                unique
+            }
+            val msg = if (deduped.size == 1) {
+                "已添加节点：${deduped.first().name}"
+            } else {
+                "已批量添加 ${deduped.size} 个节点"
+            }
+            mutateActiveProfile(profile.copy(proxies = deduped + profile.proxies), msg)
         }.onFailure { err ->
             postMessage("URI 解析失败：${err.message}")
         }
@@ -239,7 +270,9 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun addNodeFromYaml(yamlText: String) {
         val profile = _uiState.value.activeProfile ?: return
         runCatching {
-            val node = ConfigEngine.parseNodeFromYaml(yamlText, NodeSource.CUSTOM)
+            val parsed = ConfigEngine.parseNodeFromYaml(yamlText, NodeSource.CUSTOM)
+            val existingNames = profile.proxies.map { it.name }.toSet()
+            val node = ConfigEngine.ensureUniqueNodeName(parsed, existingNames)
             mutateActiveProfile(profile.copy(proxies = listOf(node) + profile.proxies), "已添加节点：${node.name}")
         }.onFailure { err ->
             postMessage("YAML 解析失败：${err.message}")
@@ -401,7 +434,15 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         val profile = _uiState.value.activeProfile ?: return
         val oldGroup = existingId?.let { id -> profile.proxyGroups.firstOrNull { it.id == id } }
         val built = if (existingId != null) {
-            ConfigEngine.buildProxyGroup(existingId, name, type, proxies, url, interval)
+            ConfigEngine.buildProxyGroup(
+                id = existingId,
+                name = name,
+                type = type,
+                proxies = proxies,
+                url = url,
+                interval = interval,
+                existingRawYaml = oldGroup?.rawYaml
+            )
         } else {
             ConfigEngine.buildProxyGroup(name = name, type = type, proxies = proxies, url = url, interval = interval)
         }
@@ -535,14 +576,15 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     ): List<ProxyGroupEntry> {
         return groups.map { group ->
             if (removedName in group.proxies) {
-                val pruned = group.proxies.filterNot { it == removedName }.ifEmpty { listOf("DIRECT") }
+                val pruned = group.proxies.filterNot { it == removedName }
                 ConfigEngine.buildProxyGroup(
                     id = group.id,
                     name = group.name,
                     type = group.type,
                     proxies = pruned,
                     url = group.url,
-                    interval = group.interval
+                    interval = group.interval,
+                    existingRawYaml = group.rawYaml
                 )
             } else {
                 group
@@ -564,7 +606,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     type = group.type,
                     proxies = replaced,
                     url = group.url,
-                    interval = group.interval
+                    interval = group.interval,
+                    existingRawYaml = group.rawYaml
                 )
             } else {
                 group
@@ -574,18 +617,24 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun mutateActiveProfile(updated: SplitProfile, successMsg: String?) {
         viewModelScope.launch {
-            val saved = repository.saveProfile(updated)
-            val list = repository.listProfiles()
-            val compiled = withContext(Dispatchers.Default) {
-                ConfigEngine.compileConfig(saved)
-            }
-            _uiState.update {
-                it.copy(
-                    profiles = list,
-                    activeProfile = saved,
-                    compiledYaml = compiled,
-                    snackbarMessage = successMsg ?: it.snackbarMessage
-                )
+            mutationMutex.withLock {
+                runCatching {
+                    val saved = repository.saveProfile(updated)
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) {
+                        ConfigEngine.compileConfig(saved)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            snackbarMessage = successMsg ?: it.snackbarMessage
+                        )
+                    }
+                }.onFailure { err ->
+                    postMessage("保存失败：${err.message}")
+                }
             }
         }
     }

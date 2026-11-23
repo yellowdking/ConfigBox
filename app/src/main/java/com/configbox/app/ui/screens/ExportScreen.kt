@@ -32,6 +32,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -50,6 +51,8 @@ import com.configbox.app.ui.theme.SkyAccent
 import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 import com.configbox.app.ui.theme.SoftSurface
+
+private const val MAX_PREVIEW_LINES = 400
 
 @Composable
 fun ExportScreen(
@@ -78,6 +81,17 @@ fun ExportScreen(
             }.onFailure { err ->
                 viewModel.postMessage("导出失败：${err.message}")
             }
+        }
+    }
+
+    val (totalLines, previewText, isTruncated) = remember(uiState.compiledYaml) {
+        val allLines = uiState.compiledYaml.lines()
+        if (allLines.size <= MAX_PREVIEW_LINES) {
+            Triple(allLines.size, uiState.compiledYaml, false)
+        } else {
+            val clipped = allLines.take(MAX_PREVIEW_LINES).joinToString("\n") +
+                "\n\n# ... 仅预览前 $MAX_PREVIEW_LINES 行（共 ${allLines.size} 行），导出 / 复制 / 本机订阅均输出完整配置 ..."
+            Triple(allLines.size, clipped, true)
         }
     }
 
@@ -183,10 +197,10 @@ fun ExportScreen(
             }
         }
 
-        // Live Compiled YAML Preview
-        val lineCount = uiState.compiledYaml.lines().size
+        // Live Compiled YAML Preview (capped for smooth rendering on large rule lists)
+        val previewSuffix = if (isTruncated) " · 已截断预览前 $MAX_PREVIEW_LINES 行" else ""
         Text(
-            text = "编译后最终 YAML 实时预览（共 $lineCount 行 · 含 ${active.proxies.count { !it.dialerProxy.isNullOrBlank() }} 个已配置 dialer-proxy 的中转节点）",
+            text = "编译后最终 YAML 实时预览（共 $totalLines 行 · 含 ${active.proxies.count { !it.dialerProxy.isNullOrBlank() }} 个已配置 dialer-proxy 的中转节点$previewSuffix）",
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Medium
         )
@@ -199,7 +213,7 @@ fun ExportScreen(
                 .weight(1f)
         ) {
             Text(
-                text = uiState.compiledYaml,
+                text = previewText,
                 modifier = Modifier
                     .padding(12.dp)
                     .verticalScroll(rememberScrollState())
