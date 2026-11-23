@@ -1175,19 +1175,7 @@ private fun AddNodeDialog(
     var subPrefix by remember { mutableStateOf("") }
     var selectedGroups by remember { mutableStateOf(setOf<String>()) }
     var uriInput by remember { mutableStateOf("") }
-    var yamlInput by remember {
-        mutableStateOf(
-            """
-            name: "自建落地节点"
-            type: socks5
-            server: 198.51.100.10
-            port: 10808
-            username: user
-            password: pass
-            udp: true
-            """.trimIndent()
-        )
-    }
+    var yamlInput by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1259,7 +1247,15 @@ private fun AddNodeDialog(
                             value = uriInput,
                             onValueChange = { uriInput = it },
                             label = { Text("支持多行批量：vless / vmess / trojan / hy2 / ss / socks5") },
-                            minLines = 4,
+                            placeholder = {
+                                Text(
+                                    text = "vless://uuid@example.com:443?security=tls#香港节点\ntrojan://password@example.com:443#日本节点",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = SlateMuted.copy(alpha = 0.6f)
+                                )
+                            },
+                            minLines = 5,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -1268,7 +1264,15 @@ private fun AddNodeDialog(
                         OutlinedTextField(
                             value = yamlInput,
                             onValueChange = { yamlInput = it },
-                            label = { Text("单节点 YAML 映射") },
+                            label = { Text("节点 YAML（支持不对齐缩进 / - 列表 / 多节点）") },
+                            placeholder = {
+                                Text(
+                                    text = "- name: 自建落地节点\n  type: socks5\n  server: 198.51.100.10\n  port: 10808\n  username: user\n  password: pass\n  udp: true",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = SlateMuted.copy(alpha = 0.6f)
+                                )
+                            },
                             textStyle = MaterialTheme.typography.labelMedium,
                             minLines = 7,
                             modifier = Modifier.fillMaxWidth()

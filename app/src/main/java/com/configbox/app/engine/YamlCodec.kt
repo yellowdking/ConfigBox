@@ -33,6 +33,16 @@ object YamlCodec {
         return Yaml(SafeConstructor(loaderOptions), representer, dumperOptions)
     }
 
+    fun parseAny(yamlText: String): Any? {
+        if (yamlText.isBlank()) return null
+        return newYaml().load<Any?>(yamlText)
+    }
+
+    fun parseAll(yamlText: String): List<Any?> {
+        if (yamlText.isBlank()) return emptyList()
+        return newYaml().loadAll(yamlText).toList()
+    }
+
     @Suppress("UNCHECKED_CAST")
     fun parseMap(yamlText: String): LinkedHashMap<String, Any?> {
         if (yamlText.isBlank()) return linkedMapOf()

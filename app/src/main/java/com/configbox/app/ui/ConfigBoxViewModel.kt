@@ -1011,10 +1011,19 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     fun addNodeFromYaml(yamlText: String) {
         val profile = _uiState.value.activeProfile ?: return
         runCatching {
-            val parsed = ConfigEngine.parseNodeFromYaml(yamlText, NodeSource.CUSTOM)
-            val existingNames = profile.proxies.map { it.name }.toSet()
-            val node = ConfigEngine.ensureUniqueNodeName(parsed, existingNames)
-            mutateActiveProfile(profile.copy(proxies = listOf(node) + profile.proxies), "已添加节点：${node.name}")
+            val parsedList = ConfigEngine.parseNodesFromYaml(yamlText, NodeSource.CUSTOM)
+            val existingNames = profile.proxies.map { it.name }.toMutableSet()
+            val deduped = parsedList.map { candidate ->
+                val unique = ConfigEngine.ensureUniqueNodeName(candidate, existingNames)
+                existingNames.add(unique.name)
+                unique
+            }
+            val msg = if (deduped.size == 1) {
+                "已添加节点：${deduped.first().name}"
+            } else {
+                "已批量添加 ${deduped.size} 个 YAML 节点"
+            }
+            mutateActiveProfile(profile.copy(proxies = deduped + profile.proxies), msg)
         }.onFailure { err ->
             postMessage("YAML 解析失败：${err.message}")
         }

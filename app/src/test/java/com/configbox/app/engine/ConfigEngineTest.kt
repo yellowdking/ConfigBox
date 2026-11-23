@@ -498,4 +498,68 @@ class ConfigEngineTest {
         val (_, secondChangedCount) = ConfigEngine.syncNodesFromPool(synced, poolV2)
         assertEquals(0, secondChangedCount)
     }
+
+    @Test
+    fun parseNodesFromYamlHandlesMisalignedIndentationNestedBlocksAndSpecialChars() {
+        // Case 1: Unindented first line + indented remaining lines (previously folded into `name` scalar)
+        val shiftedFirstLine = """
+            name: 美国落地 01
+                type: socks5
+                server: 198.51.100.10
+                port: 10808
+                username: demo
+                password: secret
+                udp: true
+        """.trimIndent()
+        val node1 = ConfigEngine.parseNodeFromYaml(shiftedFirstLine)
+        assertEquals("美国落地 01", node1.name)
+        assertEquals("socks5", node1.type)
+        assertEquals("198.51.100.10", node1.server)
+        assertEquals(10808, node1.port)
+
+        // Case 2: Ragged indentation + leading `- ` + unquoted special chars + nested ws-opts/headers + tabs + full-width colon
+        val raggedYaml = buildString {
+            appendLine("```yaml")
+            appendLine("  - name：[HK] 香港 01: VIP")
+            appendLine("\t\ttype: vless")
+            appendLine("   server:hk.example.com")
+            appendLine("     port:443")
+            appendLine("    uuid: 11111111-2222-3333-4444-555555555555")
+            appendLine("  tls: true")
+            appendLine("    network: ws")
+            appendLine("      ws-opts:")
+            appendLine("        path: /ws")
+            appendLine("        headers:")
+            appendLine("          Host: hk.example.com")
+            appendLine("  udp: true")
+            appendLine("```")
+        }
+        val node2 = ConfigEngine.parseNodeFromYaml(raggedYaml)
+        assertEquals("[HK] 香港 01: VIP", node2.name)
+        assertEquals("vless", node2.type)
+        assertEquals("hk.example.com", node2.server)
+        assertEquals(443, node2.port)
+        val node2Map = YamlCodec.parseMap(node2.rawYaml)
+        @Suppress("UNCHECKED_CAST")
+        val wsOpts = node2Map["ws-opts"] as Map<String, Any?>
+        assertEquals("/ws", wsOpts["path"])
+        @Suppress("UNCHECKED_CAST")
+        val headers = wsOpts["headers"] as Map<String, Any?>
+        assertEquals("hk.example.com", headers["Host"])
+
+        // Case 3: Multi-node paste with misaligned `- name:` blocks & inline flow maps
+        val multiYaml = """
+            - name: 节点A
+                type: trojan
+                server: a.example.com
+                port: 443
+                password: p1
+            - {name: 节点B, type: ss, server: b.example.com, port: 8388, cipher: aes-128-gcm, password: p2}
+        """.trimIndent()
+        val multiNodes = ConfigEngine.parseNodesFromYaml(multiYaml)
+        assertEquals(2, multiNodes.size)
+        assertEquals(listOf("节点A", "节点B"), multiNodes.map { it.name })
+        assertEquals("b.example.com", multiNodes[1].server)
+        assertEquals(8388, multiNodes[1].port)
+    }
 }

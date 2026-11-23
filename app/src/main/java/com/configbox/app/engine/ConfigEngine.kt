@@ -731,14 +731,400 @@ object ConfigEngine {
         }
     }
 
+    private data class YamlContainerFrame(
+        val key: String,
+        val sourceIndent: Int,
+        val outLevel: Int
+    )
+
+    private val STRICT_TOP_LEVEL_PROXY_KEYS = setOf(
+        "name", "type", "uuid", "alterid", "cipher", "password", "udp",
+        "sni", "servername", "client-fingerprint", "network", "flow",
+        "dialer-proxy", "username", "tfo", "mptcp", "ip-version",
+        "interface-name", "routing-mark", "plugin", "plugin-opts",
+        "ws-opts", "grpc-opts", "h2-opts", "http-opts", "reality-opts",
+        "smux", "ech-opts", "ss-opts", "obfs", "obfs-password", "up", "down",
+        "auth", "auth-str", "auth_str", "ports", "mport", "hop-interval",
+        "congestion-controller", "udp-relay-mode", "reduce-rtt", "disable-sni",
+        "alpn", "private-key", "peers", "ip", "ipv6", "mtu", "token",
+        "protocol-param", "obfs-param", "encryption", "packet-encoding", "xudp"
+    )
+
+    private val KNOWN_FIX_COLON_KEYS = STRICT_TOP_LEVEL_PROXY_KEYS + setOf(
+        "server", "port", "tls", "skip-cert-verify", "fingerprint",
+        "path", "host", "public-key", "short-id", "grpc-service-name", "mode"
+    )
+
+    private val YAML_KEY_VALUE_REGEX = Regex("""^([A-Za-z0-9_.-]+)\s*:(.*)$""")
+    private val YAML_FULLWIDTH_COLON_REGEX = Regex("""^(\s*(?:-\s+)?)([A-Za-z0-9_.-]+)：(.*)$""")
+    private val YAML_TIGHT_COLON_REGEX = Regex("""^(\s*(?:-\s+)?)([A-Za-z0-9_.-]+):([^\s/].*)$""")
+    private val YAML_LIST_KEY_OR_FLOW_REGEX = Regex("""^\s*-\s+(?:([A-Za-z0-9_.-]+)\s*:|\{)""")
+
     fun parseNodeFromYaml(
         yamlText: String,
         source: NodeSource = NodeSource.CUSTOM,
         subscriptionId: String? = null
     ): ProxyNode {
-        val map = YamlCodec.parseMap(yamlText)
-        return mapToProxyNode(map, source, subscriptionId)
-            ?: throw IllegalArgumentException("节点 YAML 缺少必要字段（name / type / server / port）")
+        return parseNodesFromYaml(yamlText, source, subscriptionId).first()
+    }
+
+    /**
+     * Leniently parses one or more Clash/Mihomo proxy nodes from user-pasted YAML.
+     * Supports:
+     * - Standard single-node YAML maps
+     * - Leading `- ` list items (single or multiple nodes) or `proxies:` wrappers
+     * - Misaligned / ragged indentation, tabs, full-width colons, and Markdown code fences
+     * - Inline flow maps (`- {name: ..., ...}` or `{name: ..., ...}`)
+     * - Unquoted special characters in `name:` (e.g. `[HK] 01: VIP`)
+     */
+    fun parseNodesFromYaml(
+        yamlText: String,
+        source: NodeSource = NodeSource.CUSTOM,
+        subscriptionId: String? = null
+    ): List<ProxyNode> {
+        val cleaned = sanitizeRawNodeYaml(yamlText)
+        if (cleaned.isBlank()) {
+            throw IllegalArgumentException("请输入节点 YAML 内容")
+        }
+
+        // Stage 1: Try lossless standard SnakeYAML parse across all documents
+        val strictNodes = runCatching {
+            val docs = YamlCodec.parseAll(cleaned)
+            val extracted = mutableListOf<ProxyNode>()
+            for (doc in docs) {
+                extractNodesFromParsedObject(doc, source, subscriptionId, extracted)
+            }
+            extracted
+        }.getOrNull()
+
+        if (!strictNodes.isNullOrEmpty() && strictNodes.all { isValidParsedNode(it) }) {
+            return strictNodes
+        }
+
+        // Stage 2: Split & repair misaligned / ragged / list-prefixed / inline-flow node blocks
+        val chunks = splitIntoNodeChunks(cleaned.lines())
+        val repaired = mutableListOf<ProxyNode>()
+        for (chunk in chunks) {
+            val parsed = parseSingleNodeChunk(chunk, source, subscriptionId)
+            if (parsed != null && isValidParsedNode(parsed)) {
+                repaired.add(parsed)
+            }
+        }
+
+        if (repaired.isNotEmpty()) {
+            return repaired
+        }
+
+        throw IllegalArgumentException("未能识别有效节点 YAML，请确认包含 name / type / server / port 字段")
+    }
+
+    private fun isValidParsedNode(node: ProxyNode): Boolean {
+        if (node.name.isBlank() || node.server.isBlank()) return false
+        if (node.type.equals("unknown", ignoreCase = true) || node.type.isBlank()) return false
+        // Reject mangled YAML where misaligned lines were folded into `name` scalar
+        if (node.name.contains('\n') || node.name.contains(" server:") || node.name.contains(" type:")) return false
+        return true
+    }
+
+    private fun sanitizeRawNodeYaml(raw: String): String {
+        var text = raw.removePrefix("\uFEFF")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .trim()
+        // Strip optional markdown code fences (```yaml ... ```)
+        if (text.startsWith("```")) {
+            val lines = text.lines().toMutableList()
+            if (lines.isNotEmpty() && lines.first().trimStart().startsWith("```")) {
+                lines.removeAt(0)
+            }
+            if (lines.isNotEmpty() && lines.last().trim() == "```") {
+                lines.removeAt(lines.lastIndex)
+            }
+            text = lines.joinToString("\n")
+        }
+        return text.lines().joinToString("\n") { rawLine ->
+            // Normalize leading non-breaking / ideographic spaces and tabs
+            val sb = StringBuilder()
+            var i = 0
+            while (i < rawLine.length) {
+                when (rawLine[i]) {
+                    ' ' -> sb.append(' ')
+                    '\t' -> sb.append("  ")
+                    '\u00A0', '\u3000' -> sb.append(' ')
+                    else -> break
+                }
+                i++
+            }
+            sb.append(rawLine.substring(i).trimEnd())
+            var line = sb.toString()
+
+            // Normalize full-width colon after an ASCII YAML key (e.g. `name：香港`)
+            val fwMatch = YAML_FULLWIDTH_COLON_REGEX.matchEntire(line)
+            if (fwMatch != null) {
+                line = "${fwMatch.groupValues[1]}${fwMatch.groupValues[2]}: ${fwMatch.groupValues[3].trimStart()}"
+            } else if (!line.trimStart().startsWith("{") && !line.trimStart().startsWith("- {")) {
+                // Fix missing space after colon on known proxy keys (e.g. `server:1.2.3.4`, `port:443`)
+                val tightMatch = YAML_TIGHT_COLON_REGEX.matchEntire(line)
+                if (tightMatch != null && tightMatch.groupValues[2].lowercase() in KNOWN_FIX_COLON_KEYS) {
+                    line = "${tightMatch.groupValues[1]}${tightMatch.groupValues[2]}: ${tightMatch.groupValues[3]}"
+                }
+            }
+            line
+        }
+    }
+
+    private fun extractNodesFromParsedObject(
+        parsed: Any?,
+        source: NodeSource,
+        subscriptionId: String?,
+        out: MutableList<ProxyNode>
+    ) {
+        when (parsed) {
+            is Map<*, *> -> {
+                val proxiesObj = parsed["proxies"]
+                if (proxiesObj is List<*>) {
+                    for (item in proxiesObj) {
+                        if (item is Map<*, *>) {
+                            mapToProxyNode(item, source, subscriptionId)?.let { out.add(it) }
+                        }
+                    }
+                } else {
+                    mapToProxyNode(parsed, source, subscriptionId)?.let { out.add(it) }
+                }
+            }
+            is List<*> -> {
+                for (item in parsed) {
+                    if (item is Map<*, *>) {
+                        mapToProxyNode(item, source, subscriptionId)?.let { out.add(it) }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun splitIntoNodeChunks(rawLines: List<String>): List<List<String>> {
+        val lines = rawLines.dropWhile { it.isBlank() || it.trimStart().startsWith("#") }.toMutableList()
+        if (lines.isNotEmpty() && lines.first().trim().equals("proxies:", ignoreCase = true)) {
+            lines.removeAt(0)
+        }
+
+        val chunks = mutableListOf<MutableList<String>>()
+        var current = mutableListOf<String>()
+        var currentHasName = false
+        var currentHasCoreField = false
+
+        fun flushCurrent() {
+            if (current.any { it.isNotBlank() && !it.trimStart().startsWith("#") }) {
+                chunks.add(current)
+            }
+            current = mutableListOf()
+            currentHasName = false
+            currentHasCoreField = false
+        }
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+            if (trimmed == "---" || trimmed == "...") {
+                flushCurrent()
+                continue
+            }
+
+            // Standalone inline flow object (e.g. `- {name: ...}` or `{name: ...}`)
+            val withoutDash = if (trimmed.startsWith("-")) trimmed.removePrefix("-").trimStart() else trimmed
+            if (withoutDash.startsWith("{") && withoutDash.endsWith("}")) {
+                flushCurrent()
+                chunks.add(mutableListOf(withoutDash))
+                continue
+            }
+
+            val listKeyMatch = YAML_LIST_KEY_OR_FLOW_REGEX.find(line)
+            if (listKeyMatch != null) {
+                val keyAfterDash = listKeyMatch.groupValues[1].lowercase()
+                val startsNewNode = current.isNotEmpty() && (
+                    keyAfterDash == "name" ||
+                        keyAfterDash.isEmpty() ||
+                        (currentHasName && currentHasCoreField && keyAfterDash in STRICT_TOP_LEVEL_PROXY_KEYS)
+                    )
+                if (startsNewNode) {
+                    flushCurrent()
+                }
+                if (keyAfterDash == "name") currentHasName = true
+                if (keyAfterDash == "server" || keyAfterDash == "type") currentHasCoreField = true
+                current.add(line)
+                continue
+            }
+
+            val kvMatch = YAML_KEY_VALUE_REGEX.matchEntire(trimmed)
+            val key = kvMatch?.groupValues?.get(1)?.lowercase()
+            if (key == "name" && currentHasName && currentHasCoreField) {
+                flushCurrent()
+            }
+            if (key == "name") currentHasName = true
+            if (key == "server" || key == "type") currentHasCoreField = true
+            current.add(line)
+        }
+        flushCurrent()
+        return chunks
+    }
+
+    private fun parseSingleNodeChunk(
+        chunkLines: List<String>,
+        source: NodeSource,
+        subscriptionId: String?
+    ): ProxyNode? {
+        if (chunkLines.isEmpty()) return null
+
+        // Sub-try 2a: Inline flow map `{name: ..., type: ..., ...}`
+        if (chunkLines.size == 1) {
+            val one = chunkLines.first().trim().removePrefix("-").trimStart()
+            if (one.startsWith("{") && one.endsWith("}")) {
+                val parsed = runCatching { YamlCodec.parseAny(one) as? Map<*, *> }.getOrNull()
+                val node = parsed?.let { mapToProxyNode(it, source, subscriptionId) }
+                if (node != null && isValidParsedNode(node)) return node
+            }
+        }
+
+        // Sub-try 2b: First-line-shifted dedent (handles `- name: ...` or unindented first line + indented rest)
+        run {
+            val firstStripped = stripLeadingDash(chunkLines.first()).trimStart()
+            val tailLines = chunkLines.drop(1)
+            val minTailIndent = tailLines
+                .filter { it.isNotBlank() }
+                .minOfOrNull { leadingSpaces(it) } ?: 0
+            val candidateLines = buildList {
+                add(quoteUnsafeScalarIfNeeded(firstStripped))
+                tailLines.forEach { t ->
+                    val dedented = if (t.length >= minTailIndent) t.substring(minTailIndent) else t.trimStart()
+                    add(quoteUnsafeScalarIfNeeded(dedented))
+                }
+            }
+            val parsed = runCatching { YamlCodec.parseAny(candidateLines.joinToString("\n")) as? Map<*, *> }.getOrNull()
+            val node = parsed?.let { mapToProxyNode(it, source, subscriptionId) }
+            if (node != null && isValidParsedNode(node)) return node
+        }
+
+        // Sub-try 2c: Full structural re-indenter for arbitrarily ragged / misaligned lines
+        val rebuilt = rebuildRaggedNodeYaml(chunkLines)
+        val parsedRebuilt = runCatching { YamlCodec.parseAny(rebuilt) as? Map<*, *> }.getOrNull()
+        val rebuiltNode = parsedRebuilt?.let { mapToProxyNode(it, source, subscriptionId) }
+        if (rebuiltNode != null && isValidParsedNode(rebuiltNode)) return rebuiltNode
+
+        return null
+    }
+
+    private fun rebuildRaggedNodeYaml(chunkLines: List<String>): String {
+        val out = mutableListOf<String>()
+        val stack = ArrayDeque<YamlContainerFrame>()
+
+        chunkLines.forEachIndexed { idx, rawLine ->
+            val effectiveLine = if (idx == 0) stripLeadingDash(rawLine) else rawLine
+            val rawIndent = leadingSpaces(effectiveLine)
+            val trimmed = effectiveLine.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) return@forEachIndexed
+
+            if (trimmed.startsWith("- ") || trimmed == "-") {
+                val level = stack.lastOrNull()?.outLevel ?: 0
+                if (level > 0) {
+                    out.add("  ".repeat(level) + trimmed)
+                } else {
+                    val stripped = trimmed.removePrefix("-").trimStart()
+                    if (stripped.isNotEmpty()) {
+                        out.add(quoteUnsafeScalarIfNeeded(stripped))
+                    }
+                }
+                return@forEachIndexed
+            }
+
+            val kvMatch = YAML_KEY_VALUE_REGEX.matchEntire(trimmed)
+            if (kvMatch != null) {
+                val key = kvMatch.groupValues[1]
+                val keyLower = key.lowercase()
+                val rawVal = kvMatch.groupValues[2]
+
+                val isDefiniteTopLevel = keyLower in STRICT_TOP_LEVEL_PROXY_KEYS ||
+                    ((keyLower == "server" || keyLower == "port") && stack.none { it.key == "peers" }) ||
+                    ((keyLower == "tls" || keyLower == "skip-cert-verify" || keyLower == "fingerprint") &&
+                        stack.none { it.key == "plugin-opts" })
+
+                if (isDefiniteTopLevel) {
+                    stack.clear()
+                } else {
+                    while (stack.isNotEmpty() && rawIndent <= stack.last().sourceIndent) {
+                        stack.removeLast()
+                    }
+                }
+
+                val outLevel = stack.lastOrNull()?.outLevel ?: 0
+                out.add("  ".repeat(outLevel) + formatKeyValueLine(key, rawVal))
+
+                if (rawVal.trim().isEmpty()) {
+                    stack.addLast(YamlContainerFrame(keyLower, rawIndent, outLevel + 1))
+                }
+            } else {
+                val outLevel = stack.lastOrNull()?.outLevel ?: 0
+                out.add("  ".repeat(outLevel) + trimmed)
+            }
+        }
+        return out.joinToString("\n")
+    }
+
+    private fun stripLeadingDash(line: String): String {
+        val indent = leadingSpaces(line)
+        val trimmed = line.substring(indent)
+        return if (trimmed.startsWith("- ")) {
+            " ".repeat(indent + 2) + trimmed.removePrefix("- ")
+        } else {
+            line
+        }
+    }
+
+    private fun leadingSpaces(line: String): Int {
+        var count = 0
+        while (count < line.length && line[count] == ' ') count++
+        return count
+    }
+
+    private fun quoteUnsafeScalarIfNeeded(line: String): String {
+        val indent = leadingSpaces(line)
+        val trimmed = line.substring(indent)
+        if (trimmed.startsWith("- ") || trimmed.startsWith("#")) return line
+        val kvMatch = YAML_KEY_VALUE_REGEX.matchEntire(trimmed) ?: return line
+        return " ".repeat(indent) + formatKeyValueLine(kvMatch.groupValues[1], kvMatch.groupValues[2])
+    }
+
+    private fun formatKeyValueLine(key: String, rawVal: String): String {
+        val trimmedVal = rawVal.trim()
+        if (trimmedVal.isEmpty()) return "$key:"
+        val isDoubleQuoted = trimmedVal.length >= 2 && trimmedVal.startsWith("\"") && trimmedVal.endsWith("\"")
+        val isSingleQuoted = trimmedVal.length >= 2 && trimmedVal.startsWith("'") && trimmedVal.endsWith("'")
+        if (isDoubleQuoted || isSingleQuoted) return "$key: $trimmedVal"
+
+        val keyLower = key.lowercase()
+        val isFlowMap = trimmedVal.startsWith("{") && trimmedVal.endsWith("}")
+        val isFlowList = trimmedVal.startsWith("[") && trimmedVal.endsWith("]")
+
+        val needsQuote = if (keyLower == "name") {
+            val first = trimmedVal.first()
+            first in setOf('[', '{', '@', '`', '*', '&', '!', '%', '|', '>', '?', '-', ':', '#', ',') ||
+                trimmedVal.contains(": ") ||
+                trimmedVal.contains(" #")
+        } else {
+            if (isFlowMap || isFlowList) {
+                false
+            } else {
+                val first = trimmedVal.first()
+                first in setOf('@', '`', '*', '&', '%', '[', '{') ||
+                    trimmedVal.contains(": ")
+            }
+        }
+
+        return if (needsQuote) {
+            val escaped = trimmedVal.replace("\\", "\\\\").replace("\"", "\\\"")
+            "$key: \"$escaped\""
+        } else {
+            "$key: $trimmedVal"
+        }
     }
 
     fun updateNodeBasicFields(
