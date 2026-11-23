@@ -10,6 +10,8 @@ import com.configbox.app.model.ProxyNode
 import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -34,6 +36,7 @@ import java.util.concurrent.TimeUnit
 class ProfileRepository(context: Context) {
 
     private val profilesRoot = File(context.filesDir, "profiles").apply { mkdirs() }
+    private val ioMutex = Mutex()
 
     private val json = Json {
         prettyPrint = true
@@ -47,95 +50,117 @@ class ProfileRepository(context: Context) {
         .followRedirects(true)
         .build()
 
+    private fun resolveProfileDir(profileId: String): File {
+        require(SAFE_ID_REGEX.matches(profileId)) { "非法的配置 ID：$profileId" }
+        return File(profilesRoot, profileId)
+    }
+
     suspend fun listProfiles(): List<ProfileMeta> = withContext(Dispatchers.IO) {
-        profilesRoot.listFiles()
-            ?.filter { it.isDirectory }
-            ?.mapNotNull { dir ->
-                val metaFile = File(dir, "meta.json")
-                if (!metaFile.exists()) return@mapNotNull null
-                runCatching { json.decodeFromString<ProfileMeta>(metaFile.readText()) }.getOrNull()
-            }
-            ?.sortedByDescending { it.updatedAt }
-            ?: emptyList()
+        ioMutex.withLock {
+            profilesRoot.listFiles()
+                ?.filter { it.isDirectory }
+                ?.mapNotNull { dir ->
+                    val metaFile = File(dir, "meta.json")
+                    if (!metaFile.exists()) return@mapNotNull null
+                    runCatching { json.decodeFromString<ProfileMeta>(metaFile.readText()) }.getOrNull()
+                }
+                ?.sortedByDescending { it.updatedAt }
+                ?: emptyList()
+        }
     }
 
     suspend fun loadProfile(profileId: String): SplitProfile? = withContext(Dispatchers.IO) {
-        val dir = File(profilesRoot, profileId)
-        val metaFile = File(dir, "meta.json")
-        if (!metaFile.exists()) return@withContext null
+        ioMutex.withLock {
+            if (!SAFE_ID_REGEX.matches(profileId)) return@withLock null
+            val dir = File(profilesRoot, profileId)
+            val metaFile = File(dir, "meta.json")
+            if (!metaFile.exists()) return@withLock null
 
-        val meta = json.decodeFromString<ProfileMeta>(metaFile.readText())
-        val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
-        val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
-        val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
-        val combined = subProxies + customProxies
+            val meta = runCatching {
+                json.decodeFromString<ProfileMeta>(metaFile.readText())
+            }.getOrNull() ?: return@withLock null
+            val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
+            val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
+            val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
+            val combined = subProxies + customProxies
 
-        // Restore exact user-defined node order if persisted
-        val savedOrder = File(dir, "node_order.json").takeIf { it.exists() }?.let {
-            runCatching { json.decodeFromString<List<String>>(it.readText()) }.getOrNull()
+            // Restore exact user-defined node order if persisted
+            val savedOrder = File(dir, "node_order.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<List<String>>(it.readText()) }.getOrNull()
+            }
+            val allProxies = if (!savedOrder.isNullOrEmpty()) {
+                val orderIndex = savedOrder.withIndex().associate { it.value to it.index }
+                combined.sortedBy { orderIndex[it.name] ?: Int.MAX_VALUE }
+            } else {
+                combined
+            }
+
+            val groups = readGroupListFile(File(dir, "groups.yaml"))
+            val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
+            } ?: emptyList()
+            val ruleProvidersYaml = File(dir, "rule_providers.yaml").takeIf { it.exists() }?.readText() ?: ""
+
+            SplitProfile(
+                meta = meta.copy(
+                    nodeCount = allProxies.size,
+                    groupCount = groups.size,
+                    ruleCount = rules.size,
+                    relayBoundCount = allProxies.count { !it.dialerProxy.isNullOrBlank() }
+                ),
+                baseConfigYaml = baseYaml,
+                proxies = allProxies,
+                proxyGroups = groups,
+                rules = rules,
+                ruleProvidersYaml = ruleProvidersYaml
+            )
         }
-        val allProxies = if (!savedOrder.isNullOrEmpty()) {
-            val orderIndex = savedOrder.withIndex().associate { it.value to it.index }
-            combined.sortedBy { orderIndex[it.name] ?: Int.MAX_VALUE }
-        } else {
-            combined
-        }
-
-        val groups = readGroupListFile(File(dir, "groups.yaml"))
-        val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
-            runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
-        } ?: emptyList()
-        val ruleProvidersYaml = File(dir, "rule_providers.yaml").takeIf { it.exists() }?.readText() ?: ""
-
-        SplitProfile(
-            meta = meta.copy(
-                nodeCount = allProxies.size,
-                groupCount = groups.size,
-                ruleCount = rules.size,
-                relayBoundCount = allProxies.count { !it.dialerProxy.isNullOrBlank() }
-            ),
-            baseConfigYaml = baseYaml,
-            proxies = allProxies,
-            proxyGroups = groups,
-            rules = rules,
-            ruleProvidersYaml = ruleProvidersYaml
-        )
     }
 
     suspend fun saveProfile(profile: SplitProfile): SplitProfile = withContext(Dispatchers.IO) {
-        val updatedMeta = profile.meta.copy(
-            updatedAt = System.currentTimeMillis(),
-            nodeCount = profile.proxies.size,
-            groupCount = profile.proxyGroups.size,
-            ruleCount = profile.rules.size,
-            relayBoundCount = profile.proxies.count { !it.dialerProxy.isNullOrBlank() }
-        )
-        val updated = profile.copy(meta = updatedMeta)
-        val dir = File(profilesRoot, updatedMeta.id).apply { mkdirs() }
+        ioMutex.withLock {
+            val updatedMeta = profile.meta.copy(
+                updatedAt = System.currentTimeMillis(),
+                nodeCount = profile.proxies.size,
+                groupCount = profile.proxyGroups.size,
+                ruleCount = profile.rules.size,
+                relayBoundCount = profile.proxies.count { !it.dialerProxy.isNullOrBlank() }
+            )
+            val updated = profile.copy(meta = updatedMeta)
+            val dir = resolveProfileDir(updatedMeta.id).apply { mkdirs() }
 
-        File(dir, "meta.json").writeText(json.encodeToString(updatedMeta))
-        File(dir, "base.yaml").writeText(updated.baseConfigYaml)
+            writeTextAtomic(File(dir, "meta.json"), json.encodeToString(updatedMeta))
+            writeTextAtomic(File(dir, "base.yaml"), updated.baseConfigYaml)
 
-        val subNodes = updated.proxies.filter { it.source == NodeSource.SUBSCRIPTION }
-        val customNodes = updated.proxies.filter { it.source == NodeSource.CUSTOM }
-        writeProxyListFile(File(dir, "proxies.yaml"), subNodes)
-        writeProxyListFile(File(dir, "custom_proxies.yaml"), customNodes)
-        File(dir, "node_order.json").writeText(json.encodeToString(updated.proxies.map { it.name }))
+            val subNodes = updated.proxies.filter { it.source == NodeSource.SUBSCRIPTION }
+            val customNodes = updated.proxies.filter { it.source == NodeSource.CUSTOM }
+            writeProxyListFile(File(dir, "proxies.yaml"), subNodes)
+            writeProxyListFile(File(dir, "custom_proxies.yaml"), customNodes)
+            writeTextAtomic(File(dir, "node_order.json"), json.encodeToString(updated.proxies.map { it.name }))
 
-        writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
-        File(dir, "rules.json").writeText(json.encodeToString(updated.rules))
-        File(dir, "rule_providers.yaml").writeText(updated.ruleProvidersYaml)
+            writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
+            writeTextAtomic(File(dir, "rules.json"), json.encodeToString(updated.rules))
+            writeTextAtomic(File(dir, "rule_providers.yaml"), updated.ruleProvidersYaml)
 
-        updated
+            updated
+        }
     }
 
     suspend fun deleteProfile(profileId: String) = withContext(Dispatchers.IO) {
-        File(profilesRoot, profileId).deleteRecursively()
+        ioMutex.withLock {
+            if (SAFE_ID_REGEX.matches(profileId)) {
+                File(profilesRoot, profileId).deleteRecursively()
+            }
+        }
     }
 
     suspend fun fetchSubscriptionYaml(url: String): String = withContext(Dispatchers.IO) {
+        val cleanUrl = url.trim()
+        require(cleanUrl.startsWith("http://", ignoreCase = true) || cleanUrl.startsWith("https://", ignoreCase = true)) {
+            "订阅链接必须以 http:// 或 https:// 开头"
+        }
         val request = Request.Builder()
-            .url(url.trim())
+            .url(cleanUrl)
             .header("User-Agent", "clash-verge/v2.0.0")
             .build()
         httpClient.newCall(request).execute().use { response ->
@@ -150,9 +175,19 @@ class ProfileRepository(context: Context) {
         }
     }
 
+    private fun writeTextAtomic(target: File, content: String) {
+        val tmp = File(target.parentFile, ".${target.name}.tmp")
+        tmp.writeText(content, Charsets.UTF_8)
+        if (!tmp.renameTo(target)) {
+            // Fallback for filesystems where renameTo does not replace existing targets
+            target.writeText(content, Charsets.UTF_8)
+            tmp.delete()
+        }
+    }
+
     private fun writeProxyListFile(file: File, nodes: List<ProxyNode>) {
         val maps = nodes.map { YamlCodec.parseMap(it.rawYaml) }
-        file.writeText(YamlCodec.dump(linkedMapOf("proxies" to maps)))
+        writeTextAtomic(file, YamlCodec.dump(linkedMapOf("proxies" to maps)))
     }
 
     private fun readProxyListFile(file: File, source: NodeSource): List<ProxyNode> {
@@ -168,7 +203,7 @@ class ProfileRepository(context: Context) {
 
     private fun writeGroupListFile(file: File, groups: List<ProxyGroupEntry>) {
         val maps = groups.map { YamlCodec.parseMap(it.rawYaml) }
-        file.writeText(YamlCodec.dump(linkedMapOf("proxy-groups" to maps)))
+        writeTextAtomic(file, YamlCodec.dump(linkedMapOf("proxy-groups" to maps)))
     }
 
     private fun readGroupListFile(file: File): List<ProxyGroupEntry> {
@@ -177,8 +212,8 @@ class ProfileRepository(context: Context) {
         val list = root["proxy-groups"] as? List<*> ?: return emptyList()
         return list.mapNotNull { item ->
             val map = item as? Map<*, *> ?: return@mapNotNull null
-            val name = map["name"]?.toString()?.trim() ?: return@mapNotNull null
-            val type = map["type"]?.toString()?.trim() ?: "select"
+            val name = map["name"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val type = map["type"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "select"
             val proxies = (map["proxies"] as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
             ProxyGroupEntry(
                 name = name,
@@ -189,5 +224,9 @@ class ProfileRepository(context: Context) {
                 rawYaml = YamlCodec.dump(map)
             )
         }
+    }
+
+    companion object {
+        private val SAFE_ID_REGEX = Regex("^[a-zA-Z0-9_-]+$")
     }
 }

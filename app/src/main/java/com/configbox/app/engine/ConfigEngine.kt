@@ -17,6 +17,8 @@ import java.util.UUID
 object ConfigEngine {
 
     private val SPLIT_KEYS = setOf("proxies", "proxy-groups", "rules", "rule-providers")
+    private val BUILTIN_POLICIES = setOf("DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE")
+    private val PROBE_GROUP_TYPES = setOf("url-test", "fallback", "load-balance")
 
     fun splitConfig(
         rawYaml: String,
@@ -34,10 +36,11 @@ object ConfigEngine {
         val baseYaml = if (baseMap.isEmpty()) defaultBaseYaml() else YamlCodec.dump(baseMap)
 
         val rawProxies = (root["proxies"] as? List<*>) ?: emptyList<Any?>()
-        val proxies = rawProxies.mapNotNull { item ->
+        val parsedProxies = rawProxies.mapNotNull { item ->
             val map = item as? Map<*, *> ?: return@mapNotNull null
             mapToProxyNode(map, NodeSource.SUBSCRIPTION)
         }
+        val proxies = deduplicateNodes(parsedProxies)
 
         val rawGroups = (root["proxy-groups"] as? List<*>) ?: emptyList<Any?>()
         val groups = rawGroups.mapNotNull { item ->
@@ -84,6 +87,7 @@ object ConfigEngine {
      * Refreshes ONLY subscription-sourced nodes while preserving:
      * - all user-added CUSTOM nodes
      * - all existing `dialer-proxy` bindings by node name
+     * - user-defined relative node order for surviving nodes
      * - all user-edited proxy-groups & rules
      */
     fun refreshSubscriptionNodes(
@@ -97,7 +101,7 @@ object ConfigEngine {
 
         val refreshedSubNodes = fresh.proxies.map { node ->
             val savedDialer = savedDialerByName[node.name]
-            if (!savedDialer.isNullOrBlank()) {
+            if (!savedDialer.isNullOrBlank() && savedDialer != node.name) {
                 updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, savedDialer)
             } else {
                 node
@@ -106,7 +110,10 @@ object ConfigEngine {
 
         val customNodes = existing.proxies.filter { it.source == NodeSource.CUSTOM }
         val freshSubNames = refreshedSubNodes.map { it.name }.toSet()
-        val mergedNodes = refreshedSubNodes + customNodes.filter { it.name !in freshSubNames }
+        val combined = refreshedSubNodes + customNodes.filter { it.name !in freshSubNames }
+
+        val existingOrder = existing.proxies.withIndex().associate { it.value.name to it.index }
+        val mergedNodes = combined.sortedBy { existingOrder[it.name] ?: Int.MAX_VALUE }
 
         return existing.copy(
             proxies = mergedNodes,
@@ -130,17 +137,19 @@ object ConfigEngine {
         output.putAll(baseMap)
 
         val compiledProxies = mutableListOf<LinkedHashMap<String, Any?>>()
-        val validNodeNames = mutableSetOf("DIRECT", "REJECT")
+        val validNodeNames = BUILTIN_POLICIES.toMutableSet()
 
-        for (node in profile.proxies) {
+        val uniqueNodes = deduplicateNodes(profile.proxies)
+        for (node in uniqueNodes) {
             val map = YamlCodec.parseMap(node.rawYaml)
             map["name"] = node.name
             map["type"] = node.type
             map["server"] = node.server
             map["port"] = node.port
             map["udp"] = node.udp
-            if (!node.dialerProxy.isNullOrBlank()) {
-                map["dialer-proxy"] = node.dialerProxy
+            val dialer = node.dialerProxy?.trim()?.takeIf { it.isNotBlank() && it != node.name }
+            if (dialer != null) {
+                map["dialer-proxy"] = dialer
             } else {
                 map.remove("dialer-proxy")
             }
@@ -155,11 +164,21 @@ object ConfigEngine {
             val map = YamlCodec.parseMap(group.rawYaml)
             map["name"] = group.name
             map["type"] = group.type
+
+            val hasDynamicProviders = hasDynamicGroupMembers(map)
             val filteredMembers = group.proxies
                 .filter { it in validNodeNames || (it in allGroupNames && it != group.name) }
-                .ifEmpty { listOf("DIRECT") }
-            map["proxies"] = filteredMembers
-            if (group.type == "url-test" || group.type == "fallback" || group.type == "load-balance") {
+                .distinct()
+
+            if (filteredMembers.isNotEmpty()) {
+                map["proxies"] = filteredMembers
+            } else if (!hasDynamicProviders) {
+                map["proxies"] = listOf("DIRECT")
+            } else {
+                map.remove("proxies")
+            }
+
+            if (group.type in PROBE_GROUP_TYPES) {
                 map["url"] = group.url?.takeIf { it.isNotBlank() } ?: "https://www.gstatic.com/generate_204"
                 map["interval"] = (group.interval ?: 300).coerceAtLeast(60)
             } else {
@@ -185,7 +204,9 @@ object ConfigEngine {
     }
 
     /**
-     * Builds or updates a [ProxyGroupEntry] with clean serialized YAML.
+     * Builds or updates a [ProxyGroupEntry] with clean serialized YAML while losslessly
+     * preserving extra Mihomo group fields (e.g. `icon`, `tolerance`, `filter`, `use`, `lazy`)
+     * when [existingRawYaml] is provided.
      */
     fun buildProxyGroup(
         id: String = UUID.randomUUID().toString().take(8),
@@ -193,29 +214,54 @@ object ConfigEngine {
         type: String,
         proxies: List<String>,
         url: String? = null,
-        interval: Int? = null
+        interval: Int? = null,
+        existingRawYaml: String? = null
     ): ProxyGroupEntry {
         val cleanName = name.trim()
         val cleanType = type.trim().ifBlank { "select" }
-        val cleanProxies = proxies.distinct().ifEmpty { listOf("DIRECT") }
-        val map = linkedMapOf<String, Any?>(
-            "name" to cleanName,
-            "type" to cleanType,
-            "proxies" to cleanProxies
-        )
-        val effectiveUrl = if (cleanType in setOf("url-test", "fallback", "load-balance")) {
+        val map = if (!existingRawYaml.isNullOrBlank()) {
+            runCatching { YamlCodec.parseMap(existingRawYaml) }.getOrDefault(linkedMapOf())
+        } else {
+            linkedMapOf()
+        }
+
+        val hasDynamicProviders = hasDynamicGroupMembers(map)
+        val distinctProxies = proxies.distinct()
+        val cleanProxies = if (distinctProxies.isEmpty() && !hasDynamicProviders) {
+            listOf("DIRECT")
+        } else {
+            distinctProxies
+        }
+
+        map["name"] = cleanName
+        map["type"] = cleanType
+        if (cleanProxies.isNotEmpty()) {
+            map["proxies"] = cleanProxies
+        } else {
+            map.remove("proxies")
+        }
+
+        val effectiveUrl = if (cleanType in PROBE_GROUP_TYPES) {
             url?.trim()?.ifBlank { "https://www.gstatic.com/generate_204" }
                 ?: "https://www.gstatic.com/generate_204"
         } else {
             null
         }
-        val effectiveInterval = if (cleanType in setOf("url-test", "fallback", "load-balance")) {
+        val effectiveInterval = if (cleanType in PROBE_GROUP_TYPES) {
             (interval ?: 300).coerceAtLeast(60)
         } else {
             null
         }
-        if (effectiveUrl != null) map["url"] = effectiveUrl
-        if (effectiveInterval != null) map["interval"] = effectiveInterval
+        if (effectiveUrl != null) {
+            map["url"] = effectiveUrl
+        } else {
+            map.remove("url")
+        }
+        if (effectiveInterval != null) {
+            map["interval"] = effectiveInterval
+        } else {
+            map.remove("interval")
+        }
 
         return ProxyGroupEntry(
             id = id,
@@ -230,6 +276,7 @@ object ConfigEngine {
 
     /**
      * Directly binds (or clears) `dialer-proxy` on the specified exit node IDs.
+     * Prevents self-referencing `dialer-proxy` loops where a node points to itself.
      */
     fun applyDialerProxy(
         nodes: List<ProxyNode>,
@@ -239,15 +286,53 @@ object ConfigEngine {
         val cleanEntry = entryProxy?.trim()?.ifBlank { null }
         return nodes.map { node ->
             if (node.id in exitNodeIds) {
-                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, cleanEntry)
+                val safeEntry = cleanEntry?.takeIf { it != node.name }
+                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, safeEntry)
             } else {
                 node
             }
         }
     }
 
+    /**
+     * Ensures [candidate] has a name that does not collide with [existingNames].
+     */
+    fun ensureUniqueNodeName(candidate: ProxyNode, existingNames: Set<String>): ProxyNode {
+        if (candidate.name !in existingNames) return candidate
+        var idx = 2
+        var unique = "${candidate.name} ($idx)"
+        while (unique in existingNames) {
+            idx++
+            unique = "${candidate.name} ($idx)"
+        }
+        return updateNodeBasicFields(
+            candidate,
+            newName = unique,
+            newServer = candidate.server,
+            newPort = candidate.port,
+            newUdp = candidate.udp,
+            newDialerProxy = candidate.dialerProxy
+        )
+    }
+
+    private fun deduplicateNodes(nodes: List<ProxyNode>): List<ProxyNode> {
+        val seen = mutableSetOf<String>()
+        return nodes.map { node ->
+            val unique = ensureUniqueNodeName(node, seen)
+            seen.add(unique.name)
+            unique
+        }
+    }
+
+    private fun hasDynamicGroupMembers(map: Map<String, Any?>): Boolean {
+        val useList = map["use"] as? List<*>
+        val includeAll = map["include-all"]?.toString()?.toBooleanStrictOrNull() == true
+        val includeAllProxies = map["include-all-proxies"]?.toString()?.toBooleanStrictOrNull() == true
+        return !useList.isNullOrEmpty() || includeAll || includeAllProxies
+    }
+
     fun parseRuleLine(line: String): RuleEntry {
-        val parts = line.split(",").map { it.trim() }
+        val parts = line.split(",").map { it.trim() }.filterIndexed { idx, s -> idx < 3 || s.isNotEmpty() }
         return when {
             parts.size >= 4 -> RuleEntry(
                 type = parts[0],
@@ -290,22 +375,25 @@ object ConfigEngine {
         newUdp: Boolean,
         newDialerProxy: String?
     ): ProxyNode {
+        val cleanName = newName.trim()
+        val cleanServer = newServer.trim()
+        val safeDialer = newDialerProxy?.trim()?.ifBlank { null }?.takeIf { it != cleanName }
         val map = YamlCodec.parseMap(node.rawYaml)
-        map["name"] = newName.trim()
-        map["server"] = newServer.trim()
+        map["name"] = cleanName
+        map["server"] = cleanServer
         map["port"] = newPort
         map["udp"] = newUdp
-        if (!newDialerProxy.isNullOrBlank()) {
-            map["dialer-proxy"] = newDialerProxy.trim()
+        if (safeDialer != null) {
+            map["dialer-proxy"] = safeDialer
         } else {
             map.remove("dialer-proxy")
         }
         return node.copy(
-            name = newName.trim(),
-            server = newServer.trim(),
+            name = cleanName,
+            server = cleanServer,
             port = newPort,
             udp = newUdp,
-            dialerProxy = newDialerProxy?.trim()?.ifBlank { null },
+            dialerProxy = safeDialer,
             rawYaml = YamlCodec.dump(map)
         )
     }
@@ -315,12 +403,12 @@ object ConfigEngine {
         for ((k, v) in map) {
             if (k != null) normalized[k.toString()] = YamlCodec.deepCopy(v)
         }
-        val name = normalized["name"]?.toString()?.trim() ?: return null
-        val type = normalized["type"]?.toString()?.trim() ?: "unknown"
+        val name = normalized["name"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val type = normalized["type"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
         val server = normalized["server"]?.toString()?.trim() ?: ""
         val port = normalized["port"]?.toString()?.toIntOrNull() ?: 443
         val udp = normalized["udp"]?.toString()?.toBooleanStrictOrNull() ?: true
-        val dialerProxy = normalized["dialer-proxy"]?.toString()?.trim()?.ifBlank { null }
+        val dialerProxy = normalized["dialer-proxy"]?.toString()?.trim()?.ifBlank { null }?.takeIf { it != name }
 
         return ProxyNode(
             name = name,
@@ -339,8 +427,8 @@ object ConfigEngine {
         for ((k, v) in map) {
             if (k != null) normalized[k.toString()] = YamlCodec.deepCopy(v)
         }
-        val name = normalized["name"]?.toString()?.trim() ?: return null
-        val type = normalized["type"]?.toString()?.trim() ?: "select"
+        val name = normalized["name"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val type = normalized["type"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "select"
         val proxies = (normalized["proxies"] as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
         val url = normalized["url"]?.toString()
         val interval = normalized["interval"]?.toString()?.toIntOrNull()
