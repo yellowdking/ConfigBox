@@ -18,6 +18,10 @@ import java.util.Base64
 object ProxyUriParser {
 
     private val lenientJson = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val SUPPORTED_SCHEMES = setOf(
+        "socks5", "socks", "http", "https", "trojan", "vless", "vmess", "hysteria2", "hy2", "ss"
+    )
+    private val BASE64_REGEX = Regex("^[A-Za-z0-9+/=_-]+$")
 
     fun parse(rawUri: String): ProxyNode {
         val trimmed = rawUri.trim()
@@ -38,7 +42,7 @@ object ProxyUriParser {
     }
 
     /**
-     * Parses multiple newline-separated proxy URIs, skipping blank lines.
+     * Parses multiple newline-separated proxy URIs strictly, skipping blank lines.
      */
     fun parseBatch(rawText: String): List<ProxyNode> {
         return rawText.lineSequence()
@@ -46,6 +50,53 @@ object ProxyUriParser {
             .filter { it.isNotEmpty() && !it.startsWith("#") }
             .map { parse(it) }
             .toList()
+    }
+
+    /**
+     * Parses multiple newline-separated proxy URIs leniently (ideal for remote subscriptions),
+     * returning `(parsedNodes, skippedLineCount)`.
+     */
+    fun parseBatchLenient(rawText: String): Pair<List<ProxyNode>, Int> {
+        val nodes = mutableListOf<ProxyNode>()
+        var skipped = 0
+        for (rawLine in rawText.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val parsed = runCatching { parse(line) }.getOrNull()
+            if (parsed != null) {
+                nodes.add(parsed)
+            } else {
+                skipped++
+            }
+        }
+        return nodes to skipped
+    }
+
+    /**
+     * Checks whether [text] contains at least one line starting with a known proxy URI scheme.
+     */
+    fun looksLikeUriList(text: String): Boolean {
+        return text.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .any { line ->
+                val idx = line.indexOf("://")
+                idx > 0 && line.substring(0, idx).lowercase() in SUPPORTED_SCHEMES
+            }
+    }
+
+    /**
+     * Attempts to Base64-decode a remote subscription payload (standard or URL-safe Base64,
+     * with or without padding/line wraps). Returns `null` if the payload is not valid Base64.
+     */
+    fun tryDecodeBase64Subscription(rawText: String): String? {
+        val compact = rawText.removePrefix("\uFEFF").replace(Regex("\\s+"), "")
+        if (compact.length < 12) return null
+        if (!BASE64_REGEX.matches(compact)) return null
+        return runCatching {
+            val decoded = decodeBase64(compact)
+            if (decoded.isBlank()) null else decoded
+        }.getOrNull()
     }
 
     private fun parseSocksOrHttp(raw: String, type: String): ProxyNode {

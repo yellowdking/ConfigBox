@@ -21,7 +21,23 @@ data class ProfileMeta(
     val nodeCount: Int = 0,
     val groupCount: Int = 0,
     val ruleCount: Int = 0,
-    val relayBoundCount: Int = 0
+    val relayBoundCount: Int = 0,
+    val subscriptionCount: Int = 0
+)
+
+/**
+ * An external node subscription source attached to a profile.
+ * Supports Clash YAML, Base64 URI lists, and plaintext URI lists.
+ */
+@Serializable
+data class NodeSubscription(
+    val id: String = UUID.randomUUID().toString().take(8),
+    val name: String,
+    val url: String,
+    val namePrefix: String = "",
+    val autoAddToGroups: List<String> = emptyList(),
+    val lastUpdatedAt: Long = 0L,
+    val nodeCount: Int = 0
 )
 
 /**
@@ -37,6 +53,7 @@ data class ProxyNode(
     val udp: Boolean = true,
     val dialerProxy: String? = null,
     val source: NodeSource = NodeSource.SUBSCRIPTION,
+    val subscriptionId: String? = null,
     val rawYaml: String
 )
 
@@ -92,5 +109,6 @@ data class SplitProfile(
     val proxies: List<ProxyNode>,
     val proxyGroups: List<ProxyGroupEntry>,
     val rules: List<RuleEntry>,
-    val ruleProvidersYaml: String
+    val ruleProvidersYaml: String,
+    val nodeSubscriptions: List<NodeSubscription> = emptyList()
 )

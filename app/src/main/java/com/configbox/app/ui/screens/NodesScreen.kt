@@ -16,16 +16,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.DragIndicator
+import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.DragIndicator
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -36,7 +40,9 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -58,6 +64,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.configbox.app.model.NodeSource
+import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProxyNode
 import com.configbox.app.ui.ConfigBoxUiState
 import com.configbox.app.ui.ConfigBoxViewModel
@@ -73,6 +80,9 @@ import com.configbox.app.ui.theme.SkyAccent
 import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 import com.configbox.app.ui.theme.SoftSurface
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun NodesScreen(
@@ -85,24 +95,43 @@ fun NodesScreen(
         return
     }
 
-    var subTab by remember { mutableIntStateOf(0) } // 0 = 全部节点, 1 = 中转配置 (dialer-proxy)
+    var subTab by remember { mutableIntStateOf(0) } // 0 = 全部节点, 1 = 节点订阅, 2 = 中转绑定
     var searchQuery by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf("全部") }
     var showAddNodeDialog by remember { mutableStateOf(false) }
     var showRelayBindDialog by remember { mutableStateOf(false) }
     var editingNode by remember { mutableStateOf<ProxyNode?>(null) }
+    var showAddSubDialog by remember { mutableStateOf(false) }
+    var editingSub by remember { mutableStateOf<NodeSubscription?>(null) }
+    var deletingSub by remember { mutableStateOf<NodeSubscription?>(null) }
 
-    val protocolFilters = remember(active.proxies) {
-        listOf("全部", "已中转", "自定义") + active.proxies.map { it.type.uppercase() }.distinct().sorted()
+    val subNameById = remember(active.nodeSubscriptions) {
+        active.nodeSubscriptions.associate { it.id to it.name }
+    }
+    val subIdByFilterLabel = remember(active.nodeSubscriptions) {
+        active.nodeSubscriptions.associate { "订阅:${it.name}" to it.id }
     }
 
-    val filteredNodes = remember(active.proxies, searchQuery, selectedFilter) {
+    val protocolFilters = remember(active.proxies, active.nodeSubscriptions) {
+        buildList {
+            add("全部")
+            add("已中转")
+            add("自定义")
+            active.nodeSubscriptions.forEach { add("订阅:${it.name}") }
+            addAll(active.proxies.map { it.type.uppercase() }.distinct().sorted())
+        }
+    }
+
+    val effectiveFilter = if (selectedFilter in protocolFilters) selectedFilter else "全部"
+
+    val filteredNodes = remember(active.proxies, searchQuery, effectiveFilter, subIdByFilterLabel) {
         active.proxies.filter { node ->
-            val matchFilter = when (selectedFilter) {
-                "全部" -> true
-                "已中转" -> !node.dialerProxy.isNullOrBlank()
-                "自定义" -> node.source == NodeSource.CUSTOM
-                else -> node.type.equals(selectedFilter, ignoreCase = true)
+            val matchFilter = when {
+                effectiveFilter == "全部" -> true
+                effectiveFilter == "已中转" -> !node.dialerProxy.isNullOrBlank()
+                effectiveFilter == "自定义" -> node.source == NodeSource.CUSTOM
+                effectiveFilter in subIdByFilterLabel -> node.subscriptionId == subIdByFilterLabel[effectiveFilter]
+                else -> node.type.equals(effectiveFilter, ignoreCase = true)
             }
             val matchQuery = searchQuery.isBlank() ||
                 node.name.contains(searchQuery, ignoreCase = true) ||
@@ -115,117 +144,128 @@ fun NodesScreen(
         active.proxies.filter { !it.dialerProxy.isNullOrBlank() }
     }
 
+    val groupNames = remember(active.proxyGroups) {
+        active.proxyGroups.map { it.name }
+    }
+
     val entryCandidates = remember(active.proxyGroups, active.proxies) {
         active.proxyGroups.map { it.name } + active.proxies.map { it.name }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
+            if (uiState.isLoading) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = SkyAccent
+                )
+            }
+
             TabRow(selectedTabIndex = subTab, containerColor = PureWhite) {
                 Tab(
                     selected = subTab == 0,
                     onClick = { subTab = 0 },
-                    text = { Text("全部节点 (${active.proxies.size})", fontSize = 13.sp) }
+                    text = { Text("全部节点 (${active.proxies.size})", fontSize = 12.sp, maxLines = 1) }
                 )
                 Tab(
                     selected = subTab == 1,
                     onClick = { subTab = 1 },
-                    text = { Text("中转绑定 (${relayedNodes.size})", fontSize = 13.sp) }
+                    text = { Text("节点订阅 (${active.nodeSubscriptions.size})", fontSize = 12.sp, maxLines = 1) }
+                )
+                Tab(
+                    selected = subTab == 2,
+                    onClick = { subTab = 2 },
+                    text = { Text("中转绑定 (${relayedNodes.size})", fontSize = 12.sp, maxLines = 1) }
                 )
             }
 
-            if (subTab == 0) {
-                Surface(color = PureWhite) {
-                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            placeholder = { Text("搜索节点名称或服务器地址...", fontSize = 13.sp) },
-                            leadingIcon = { Icon(Icons.Outlined.Search, null, Modifier.size(18.dp)) },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            protocolFilters.forEach { tag ->
-                                FilterChip(
-                                    selected = selectedFilter == tag,
-                                    onClick = { selectedFilter = tag },
-                                    label = { Text(tag, fontSize = 12.sp) }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                val canDragReorder = searchQuery.isBlank() && selectedFilter == "全部"
-                val nodeListState = rememberLazyListState()
-                val nodeReorderState = rememberDragReorderState(listState = nodeListState, headerCount = 1)
-
-                LazyColumn(
-                    state = nodeListState,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .longPressReorderContainer(
-                            reorderState = nodeReorderState,
-                            enabled = canDragReorder,
-                            itemCount = filteredNodes.size,
-                            onSwap = { from, to -> viewModel.swapNodesInMemory(from, to) },
-                            onDragFinished = { viewModel.persistCurrentOrder() }
-                        ),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 84.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    item(key = "nodes_hint") {
-                        Text(
-                            text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑" else "清除搜索和筛选后可长按拖动排序",
-                            style = MaterialTheme.typography.labelMedium
-                        )
-                    }
-                    itemsIndexed(filteredNodes, key = { _, node -> node.id }) { idx, node ->
-                        val isDragging = nodeReorderState.draggedDataIndex == idx
-                        NodeCard(
-                            node = node,
-                            isDragging = isDragging,
-                            modifier = Modifier.draggedItemVisual(isDragging, nodeReorderState.dragOffsetY),
-                            showDragHandle = canDragReorder,
-                            onClick = { editingNode = node },
-                            onDelete = { viewModel.deleteNode(node.id) }
-                        )
-                    }
-                }
-            } else {
-                // Direct 2-hop dialer-proxy binding screen (Entry -> Exit, no middle hop, no auto-created group)
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    item {
-                        Surface(
-                            color = PureWhite,
-                            border = BorderStroke(1.dp, BorderGray),
-                            shape = MaterialTheme.shapes.medium,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(14.dp)) {
-                                Text("简洁中转绑定（入口前置 → 出口落地）", style = MaterialTheme.typography.titleMedium)
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    text = "配置后直接在出口落地节点上写入 dialer-proxy，不生成多余副本和隐藏策略组；如需独立分组，直接在「策略组」页手动创建即可。",
-                                    fontSize = 12.sp,
-                                    color = SlateMuted
-                                )
+            when (subTab) {
+                0 -> {
+                    Surface(color = PureWhite) {
+                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                            OutlinedTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                placeholder = { Text("搜索节点名称或服务器地址...", fontSize = 13.sp) },
+                                leadingIcon = { Icon(Icons.Outlined.Search, null, Modifier.size(18.dp)) },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                protocolFilters.forEach { tag ->
+                                    FilterChip(
+                                        selected = effectiveFilter == tag,
+                                        onClick = { selectedFilter = tag },
+                                        label = { Text(tag, fontSize = 12.sp) }
+                                    )
+                                }
                             }
                         }
                     }
 
-                    if (relayedNodes.isEmpty()) {
+                    val canDragReorder = searchQuery.isBlank() && effectiveFilter == "全部"
+                    val nodeListState = rememberLazyListState()
+                    val nodeReorderState = rememberDragReorderState(listState = nodeListState, headerCount = 1)
+
+                    LazyColumn(
+                        state = nodeListState,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .longPressReorderContainer(
+                                reorderState = nodeReorderState,
+                                enabled = canDragReorder,
+                                itemCount = filteredNodes.size,
+                                onSwap = { from, to -> viewModel.swapNodesInMemory(from, to) },
+                                onDragFinished = { viewModel.persistCurrentOrder() }
+                            ),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 84.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        item(key = "nodes_hint") {
+                            Text(
+                                text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑" else "清除搜索和筛选后可长按拖动排序",
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                        itemsIndexed(filteredNodes, key = { _, node -> node.id }) { idx, node ->
+                            val isDragging = nodeReorderState.draggedDataIndex == idx
+                            NodeCard(
+                                node = node,
+                                subscriptionName = node.subscriptionId?.let { subNameById[it] },
+                                isDragging = isDragging,
+                                modifier = Modifier.draggedItemVisual(isDragging, nodeReorderState.dragOffsetY),
+                                showDragHandle = canDragReorder,
+                                onClick = { editingNode = node },
+                                onDelete = { viewModel.deleteNode(node.id) }
+                            )
+                        }
+                    }
+                }
+
+                1 -> {
+                    NodeSubscriptionsPane(
+                        subscriptions = active.nodeSubscriptions,
+                        isLoading = uiState.isLoading,
+                        onRefreshAll = { viewModel.refreshAllNodeSubscriptions() },
+                        onRefreshOne = { viewModel.refreshNodeSubscription(it.id) },
+                        onEdit = { editingSub = it },
+                        onDelete = { deletingSub = it }
+                    )
+                }
+
+                else -> {
+                    // Direct 2-hop dialer-proxy binding screen (Entry -> Exit)
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         item {
                             Surface(
                                 color = PureWhite,
@@ -233,46 +273,67 @@ fun NodesScreen(
                                 shape = MaterialTheme.shapes.medium,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text(
-                                    text = "暂无已配置中转的落地节点，点击右下角按钮为出口落地节点绑定入口前置代理。",
-                                    modifier = Modifier.padding(20.dp),
-                                    fontSize = 13.sp,
-                                    color = SlateMuted
-                                )
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Text("简洁中转绑定（入口前置 → 出口落地）", style = MaterialTheme.typography.titleMedium)
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(
+                                        text = "配置后直接在出口落地节点上写入 dialer-proxy，不生成多余副本和隐藏策略组；如需独立分组，直接在「策略组」页手动创建即可。",
+                                        fontSize = 12.sp,
+                                        color = SlateMuted
+                                    )
+                                }
                             }
                         }
-                    } else {
-                        itemsIndexed(relayedNodes, key = { _, it -> it.id }) { _, node ->
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = CardDefaults.cardColors(containerColor = PureWhite),
-                                border = BorderStroke(1.5.dp, EmeraldActive),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+
+                        if (relayedNodes.isEmpty()) {
+                            item {
+                                Surface(
+                                    color = PureWhite,
+                                    border = BorderStroke(1.dp, BorderGray),
+                                    shape = MaterialTheme.shapes.medium,
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = "入口 [${node.dialerProxy}] → 出口 [${node.name}]",
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = SlateInk
-                                        )
-                                        Spacer(Modifier.height(4.dp))
-                                        Text(
-                                            text = "dialer-proxy: ${node.dialerProxy}  ·  ${node.server}:${node.port}",
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 11.sp,
-                                            color = SlateMuted
-                                        )
-                                    }
-                                    IconButton(onClick = { viewModel.clearNodeRelay(node.id) }) {
-                                        Icon(Icons.Outlined.LinkOff, contentDescription = "解绑中转", tint = RoseDanger)
+                                    Text(
+                                        text = "暂无已配置中转的落地节点，点击右下角按钮为出口落地节点绑定入口前置代理。",
+                                        modifier = Modifier.padding(20.dp),
+                                        fontSize = 13.sp,
+                                        color = SlateMuted
+                                    )
+                                }
+                            }
+                        } else {
+                            itemsIndexed(relayedNodes, key = { _, it -> it.id }) { _, node ->
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = CardDefaults.cardColors(containerColor = PureWhite),
+                                    border = BorderStroke(1.5.dp, EmeraldActive),
+                                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(14.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "入口 [${node.dialerProxy}] → 出口 [${node.name}]",
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = SlateInk
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = "dialer-proxy: ${node.dialerProxy}  ·  ${node.server}:${node.port}",
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = 11.sp,
+                                                color = SlateMuted
+                                            )
+                                        }
+                                        IconButton(onClick = { viewModel.clearNodeRelay(node.id) }) {
+                                            Icon(Icons.Outlined.LinkOff, contentDescription = "解绑中转", tint = RoseDanger)
+                                        }
                                     }
                                 }
                             }
@@ -283,7 +344,13 @@ fun NodesScreen(
         }
 
         FloatingActionButton(
-            onClick = { if (subTab == 0) showAddNodeDialog = true else showRelayBindDialog = true },
+            onClick = {
+                when (subTab) {
+                    0 -> showAddNodeDialog = true
+                    1 -> showAddSubDialog = true
+                    else -> showRelayBindDialog = true
+                }
+            },
             containerColor = SkyAccent,
             contentColor = PureWhite,
             modifier = Modifier
@@ -291,22 +358,105 @@ fun NodesScreen(
                 .padding(16.dp)
         ) {
             Icon(
-                imageVector = if (subTab == 0) Icons.Outlined.Add else Icons.Outlined.Link,
-                contentDescription = if (subTab == 0) "添加节点" else "绑定中转"
+                imageVector = when (subTab) {
+                    0 -> Icons.Outlined.Add
+                    1 -> Icons.Outlined.CloudDownload
+                    else -> Icons.Outlined.Link
+                },
+                contentDescription = when (subTab) {
+                    0 -> "添加节点"
+                    1 -> "添加节点订阅"
+                    else -> "绑定中转"
+                }
             )
         }
     }
 
     if (showAddNodeDialog) {
         AddNodeDialog(
+            groupNames = groupNames,
             onDismiss = { showAddNodeDialog = false },
             onAddUri = { uri ->
                 showAddNodeDialog = false
                 viewModel.addNodeFromUri(uri)
             },
+            onAddSubscription = { name, url, prefix, groups ->
+                showAddNodeDialog = false
+                viewModel.addOrUpdateNodeSubscription(
+                    existingId = null,
+                    name = name,
+                    url = url,
+                    namePrefix = prefix,
+                    autoAddToGroups = groups
+                )
+            },
             onAddYaml = { yaml ->
                 showAddNodeDialog = false
                 viewModel.addNodeFromYaml(yaml)
+            }
+        )
+    }
+
+    if (showAddSubDialog || editingSub != null) {
+        NodeSubscriptionDialog(
+            existing = editingSub,
+            groupNames = groupNames,
+            onDismiss = {
+                showAddSubDialog = false
+                editingSub = null
+            },
+            onConfirm = { name, url, prefix, groups ->
+                val id = editingSub?.id
+                showAddSubDialog = false
+                editingSub = null
+                viewModel.addOrUpdateNodeSubscription(
+                    existingId = id,
+                    name = name,
+                    url = url,
+                    namePrefix = prefix,
+                    autoAddToGroups = groups
+                )
+            }
+        )
+    }
+
+    deletingSub?.let { sub ->
+        AlertDialog(
+            onDismissRequest = { deletingSub = null },
+            containerColor = PureWhite,
+            title = { Text("删除节点订阅") },
+            text = {
+                Text(
+                    text = "确定要删除订阅「${sub.name}」（当前关联 ${sub.nodeCount} 个节点）吗？\n\n您可以选择同时清理其节点，或仅移除订阅并将节点保留为自定义节点。",
+                    fontSize = 13.sp,
+                    color = SlateInk
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = RoseDanger),
+                    onClick = {
+                        deletingSub = null
+                        viewModel.deleteNodeSubscription(sub.id, removeNodes = true)
+                    }
+                ) {
+                    Text("删除并清理节点")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = {
+                            deletingSub = null
+                            viewModel.deleteNodeSubscription(sub.id, removeNodes = false)
+                        }
+                    ) {
+                        Text("仅删订阅(留节点)")
+                    }
+                    TextButton(onClick = { deletingSub = null }) {
+                        Text("取消")
+                    }
+                }
             }
         )
     }
@@ -338,6 +488,272 @@ fun NodesScreen(
             }
         )
     }
+}
+
+@Composable
+private fun NodeSubscriptionsPane(
+    subscriptions: List<NodeSubscription>,
+    isLoading: Boolean,
+    onRefreshAll: () -> Unit,
+    onRefreshOne: (NodeSubscription) -> Unit,
+    onEdit: (NodeSubscription) -> Unit,
+    onDelete: (NodeSubscription) -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item {
+            Surface(
+                color = PureWhite,
+                border = BorderStroke(1.dp, BorderGray),
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("多源节点订阅（自动拉取与同步）", style = MaterialTheme.typography.titleMedium)
+                        if (subscriptions.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = onRefreshAll,
+                                enabled = !isLoading,
+                                border = BorderStroke(1.dp, BorderGray),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Outlined.Refresh, null, Modifier.size(15.dp), tint = SkyAccent)
+                                Spacer(Modifier.width(4.dp))
+                                Text("全部更新", fontSize = 12.sp, color = SlateInk)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "可添加多个机场或自建节点订阅（支持 Clash YAML、Base64 及纯文本 URI 列表），一键拉取合并到当前配置，并可自动加入指定策略组，无需每次手动粘贴节点。",
+                        fontSize = 12.sp,
+                        color = SlateMuted
+                    )
+                }
+            }
+        }
+
+        if (subscriptions.isEmpty()) {
+            item {
+                Surface(
+                    color = PureWhite,
+                    border = BorderStroke(1.dp, BorderGray),
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "尚未添加节点订阅。点击右下角按钮添加订阅链接，即可自动导入并随时一键更新节点。",
+                        modifier = Modifier.padding(20.dp),
+                        fontSize = 13.sp,
+                        color = SlateMuted
+                    )
+                }
+            }
+        } else {
+            items(subscriptions, key = { it.id }) { sub ->
+                NodeSubscriptionCard(
+                    sub = sub,
+                    isLoading = isLoading,
+                    onRefresh = { onRefreshOne(sub) },
+                    onEdit = { onEdit(sub) },
+                    onDelete = { onDelete(sub) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodeSubscriptionCard(
+    sub: NodeSubscription,
+    isLoading: Boolean,
+    onRefresh: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val updatedLabel = remember(sub.lastUpdatedAt) {
+        if (sub.lastUpdatedAt <= 0L) {
+            "尚未更新"
+        } else {
+            "更新于 ${SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(sub.lastUpdatedAt))}"
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = PureWhite),
+        border = BorderStroke(1.dp, BorderGray),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = sub.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        BadgeTag("${sub.nodeCount} 节点", SkyAccent)
+                        if (sub.namePrefix.isNotBlank()) {
+                            Spacer(Modifier.width(4.dp))
+                            BadgeTag("前缀:${sub.namePrefix.trim()}", AmberBadge)
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = sub.url,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = SlateMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(onClick = onRefresh, enabled = !isLoading, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Outlined.Refresh, contentDescription = "更新订阅节点", tint = SkyAccent, modifier = Modifier.size(19.dp))
+                }
+                IconButton(onClick = onEdit, enabled = !isLoading, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Outlined.Edit, contentDescription = "编辑订阅", tint = SlateMuted, modifier = Modifier.size(18.dp))
+                }
+                IconButton(onClick = onDelete, enabled = !isLoading, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除订阅", tint = RoseDanger, modifier = Modifier.size(18.dp))
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (sub.autoAddToGroups.isNotEmpty()) {
+                        "自动加入策略组: ${sub.autoAddToGroups.joinToString("、")}"
+                    } else {
+                        "仅导入节点池（不自动改策略组）"
+                    },
+                    fontSize = 11.sp,
+                    color = if (sub.autoAddToGroups.isNotEmpty()) EmeraldActive else SlateMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = updatedLabel,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    color = SlateMuted
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodeSubscriptionDialog(
+    existing: NodeSubscription?,
+    groupNames: List<String>,
+    onDismiss: () -> Unit,
+    onConfirm: (name: String, url: String, namePrefix: String, autoAddToGroups: List<String>) -> Unit
+) {
+    var name by remember { mutableStateOf(existing?.name.orEmpty()) }
+    var url by remember { mutableStateOf(existing?.url.orEmpty()) }
+    var namePrefix by remember { mutableStateOf(existing?.namePrefix.orEmpty()) }
+    var selectedGroups by remember { mutableStateOf(existing?.autoAddToGroups?.toSet() ?: emptySet()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text(if (existing == null) "添加节点订阅" else "编辑节点订阅") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("订阅名称") },
+                    placeholder = { Text("例如：备用机场 / 落地节点") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    label = { Text("订阅链接 (Clash YAML / Base64 / URI)") },
+                    placeholder = { Text("https://...") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = namePrefix,
+                    onValueChange = { namePrefix = it },
+                    label = { Text("节点名称前缀（可选，防止多机场重名）") },
+                    placeholder = { Text("例如：[备用] ") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (groupNames.isNotEmpty()) {
+                    Text(
+                        text = "同步后自动加入以下策略组（可选，多选）",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        groupNames.forEach { groupName ->
+                            val isSelected = groupName in selectedGroups
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    selectedGroups = if (isSelected) selectedGroups - groupName else selectedGroups + groupName
+                                },
+                                label = { Text(groupName, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                onClick = {
+                    onConfirm(
+                        name.ifBlank { "节点订阅" },
+                        url,
+                        namePrefix,
+                        groupNames.filter { it in selectedGroups }
+                    )
+                },
+                enabled = url.isNotBlank()
+            ) {
+                Text("保存并拉取节点")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
 }
 
 @Composable
@@ -429,6 +845,7 @@ private fun BindRelayDialog(
 @Composable
 private fun NodeCard(
     node: ProxyNode,
+    subscriptionName: String?,
     isDragging: Boolean,
     showDragHandle: Boolean,
     modifier: Modifier = Modifier,
@@ -472,6 +889,9 @@ private fun NodeCard(
                     if (node.source == NodeSource.CUSTOM) {
                         Spacer(Modifier.width(4.dp))
                         BadgeTag("自定义", EmeraldActive)
+                    } else if (!subscriptionName.isNullOrBlank()) {
+                        Spacer(Modifier.width(4.dp))
+                        BadgeTag(subscriptionName, AmberBadge)
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -512,11 +932,17 @@ private fun BadgeTag(text: String, color: androidx.compose.ui.graphics.Color) {
 
 @Composable
 private fun AddNodeDialog(
+    groupNames: List<String>,
     onDismiss: () -> Unit,
     onAddUri: (String) -> Unit,
+    onAddSubscription: (name: String, url: String, namePrefix: String, autoAddToGroups: List<String>) -> Unit,
     onAddYaml: (String) -> Unit
 ) {
-    var tab by remember { mutableIntStateOf(0) }
+    var tab by remember { mutableIntStateOf(0) } // 0 = 订阅链接, 1 = URI 链接, 2 = 节点 YAML
+    var subName by remember { mutableStateOf("") }
+    var subUrl by remember { mutableStateOf("") }
+    var subPrefix by remember { mutableStateOf("") }
+    var selectedGroups by remember { mutableStateOf(setOf<String>()) }
     var uriInput by remember { mutableStateOf("") }
     var yamlInput by remember {
         mutableStateOf(
@@ -535,40 +961,113 @@ private fun AddNodeDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PureWhite,
-        title = { Text("添加自定义节点") },
+        title = { Text("添加节点") },
         text = {
             Column {
                 TabRow(selectedTabIndex = tab, containerColor = PureWhite) {
-                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("URI 链接") })
-                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("节点 YAML") })
+                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("订阅导入", fontSize = 12.sp) })
+                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("URI 链接", fontSize = 12.sp) })
+                    Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("YAML", fontSize = 12.sp) })
                 }
                 Spacer(Modifier.height(12.dp))
-                if (tab == 0) {
-                    OutlinedTextField(
-                        value = uriInput,
-                        onValueChange = { uriInput = it },
-                        label = { Text("socks5:// / http:// / vless:// / trojan:// / hy2:// / ss://") },
-                        minLines = 3,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                } else {
-                    OutlinedTextField(
-                        value = yamlInput,
-                        onValueChange = { yamlInput = it },
-                        label = { Text("单节点 YAML 映射") },
-                        textStyle = MaterialTheme.typography.labelMedium,
-                        minLines = 7,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                when (tab) {
+                    0 -> {
+                        Column(
+                            modifier = Modifier.verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = subName,
+                                onValueChange = { subName = it },
+                                label = { Text("订阅名称") },
+                                placeholder = { Text("例如：备用机场 / 落地订阅") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = subUrl,
+                                onValueChange = { subUrl = it },
+                                label = { Text("订阅链接 (Clash YAML / Base64 / URI)") },
+                                placeholder = { Text("https://...") },
+                                minLines = 2,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = subPrefix,
+                                onValueChange = { subPrefix = it },
+                                label = { Text("节点名称前缀（可选）") },
+                                placeholder = { Text("例如：[备用] ") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            if (groupNames.isNotEmpty()) {
+                                Text("自动加入策略组（可选）", style = MaterialTheme.typography.labelMedium)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    groupNames.forEach { g ->
+                                        val isSelected = g in selectedGroups
+                                        FilterChip(
+                                            selected = isSelected,
+                                            onClick = {
+                                                selectedGroups = if (isSelected) selectedGroups - g else selectedGroups + g
+                                            },
+                                            label = { Text(g, fontSize = 11.sp) }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    1 -> {
+                        OutlinedTextField(
+                            value = uriInput,
+                            onValueChange = { uriInput = it },
+                            label = { Text("支持多行批量：vless / vmess / trojan / hy2 / ss / socks5") },
+                            minLines = 4,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    else -> {
+                        OutlinedTextField(
+                            value = yamlInput,
+                            onValueChange = { yamlInput = it },
+                            label = { Text("单节点 YAML 映射") },
+                            textStyle = MaterialTheme.typography.labelMedium,
+                            minLines = 7,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
             }
         },
         confirmButton = {
             Button(
-                onClick = { if (tab == 0) onAddUri(uriInput) else onAddYaml(yamlInput) },
-                enabled = if (tab == 0) uriInput.isNotBlank() else yamlInput.isNotBlank()
+                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+                onClick = {
+                    when (tab) {
+                        0 -> onAddSubscription(
+                            subName.ifBlank { "节点订阅" },
+                            subUrl,
+                            subPrefix,
+                            groupNames.filter { it in selectedGroups }
+                        )
+                        1 -> onAddUri(uriInput)
+                        else -> onAddYaml(yamlInput)
+                    }
+                },
+                enabled = when (tab) {
+                    0 -> subUrl.isNotBlank()
+                    1 -> uriInput.isNotBlank()
+                    else -> yamlInput.isNotBlank()
+                }
             ) {
-                Text("添加")
+                Text(if (tab == 0) "订阅并拉取" else "添加")
             }
         },
         dismissButton = {

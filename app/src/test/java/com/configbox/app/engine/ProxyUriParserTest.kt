@@ -1,6 +1,7 @@
 package com.configbox.app.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
@@ -75,5 +76,24 @@ class ProxyUriParserTest {
         assertEquals("2001:db8::1", ss.server)
         assertEquals(8388, ss.port)
         assertTrue(ss.rawYaml.contains("aes-256-gcm"))
+    }
+
+    @Test
+    fun lenientBatchAndBase64SubscriptionDecodingWork() {
+        val raw = """
+            # comment line
+            trojan://pwd@a.example.com:443#A
+            tuic://unsupported@b.example.com:443#B
+            socks5://u:p@198.51.100.5:1080#C
+        """.trimIndent()
+        val (nodes, skipped) = ProxyUriParser.parseBatchLenient(raw)
+        assertEquals(2, nodes.size)
+        assertEquals(1, skipped)
+        assertTrue(ProxyUriParser.looksLikeUriList(raw))
+
+        val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(raw.toByteArray(Charsets.UTF_8))
+        val decoded = ProxyUriParser.tryDecodeBase64Subscription(b64)
+        assertNotNull(decoded)
+        assertTrue(ProxyUriParser.looksLikeUriList(decoded!!))
     }
 }

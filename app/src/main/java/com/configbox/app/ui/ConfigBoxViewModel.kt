@@ -7,6 +7,7 @@ import com.configbox.app.data.ProfileRepository
 import com.configbox.app.engine.ConfigEngine
 import com.configbox.app.engine.ProxyUriParser
 import com.configbox.app.model.NodeSource
+import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.RuleEntry
@@ -21,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 data class ConfigBoxUiState(
     val profiles: List<ProfileMeta> = emptyList(),
@@ -243,6 +245,163 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // --- Extra Node Subscriptions (Subscribe to Add & Sync Nodes) ---
+
+    fun addOrUpdateNodeSubscription(
+        existingId: String?,
+        name: String,
+        url: String,
+        namePrefix: String = "",
+        autoAddToGroups: List<String> = emptyList()
+    ) {
+        val cleanUrl = url.trim()
+        if (cleanUrl.isBlank()) {
+            postMessage("请输入订阅链接")
+            return
+        }
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val profile = _uiState.value.activeProfile ?: return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val sub = NodeSubscription(
+                        id = existingId ?: UUID.randomUUID().toString().take(8),
+                        name = name.trim().ifBlank { "节点订阅" },
+                        url = cleanUrl,
+                        namePrefix = if (namePrefix.isBlank()) "" else namePrefix.trimStart(),
+                        autoAddToGroups = autoAddToGroups.distinct()
+                    )
+                    val rawContent = repository.fetchSubscriptionYaml(cleanUrl)
+                    val (updated, summary) = withContext(Dispatchers.Default) {
+                        ConfigEngine.applyNodeSubscription(profile, sub, rawContent)
+                    }
+                    val saved = repository.saveProfile(updated)
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) {
+                        ConfigEngine.compileConfig(saved)
+                    }
+                    val skipNote = if (summary.skippedCount > 0) "，跳过 ${summary.skippedCount} 条不支持协议" else ""
+                    val groupNote = if (sub.autoAddToGroups.isNotEmpty()) "，已同步至 ${sub.autoAddToGroups.size} 个策略组" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "订阅「${sub.name}」已同步：共 ${summary.totalNodes} 节点（+${summary.addedCount}/-${summary.removedCount}$skipNote）$groupNote"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "节点订阅拉取失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun refreshNodeSubscription(subscriptionId: String) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val profile = _uiState.value.activeProfile ?: return@withLock
+                val sub = profile.nodeSubscriptions.firstOrNull { it.id == subscriptionId } ?: return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val rawContent = repository.fetchSubscriptionYaml(sub.url)
+                    val (updated, summary) = withContext(Dispatchers.Default) {
+                        ConfigEngine.applyNodeSubscription(profile, sub, rawContent)
+                    }
+                    val saved = repository.saveProfile(updated)
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) {
+                        ConfigEngine.compileConfig(saved)
+                    }
+                    val skipNote = if (summary.skippedCount > 0) "，跳过 ${summary.skippedCount} 条" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已更新「${sub.name}」：共 ${summary.totalNodes} 节点（+${summary.addedCount}/-${summary.removedCount}$skipNote）"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "更新「${sub.name}」失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun refreshAllNodeSubscriptions() {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val initial = _uiState.value.activeProfile ?: return@withLock
+                if (initial.nodeSubscriptions.isEmpty()) {
+                    postMessage("当前配置尚未添加节点订阅")
+                    return@withLock
+                }
+                _uiState.update { it.copy(isLoading = true) }
+                var current = initial
+                var successCount = 0
+                var failCount = 0
+                var addedTotal = 0
+                var removedTotal = 0
+                for (sub in initial.nodeSubscriptions) {
+                    val res = runCatching {
+                        val rawContent = repository.fetchSubscriptionYaml(sub.url)
+                        withContext(Dispatchers.Default) {
+                            ConfigEngine.applyNodeSubscription(current, sub, rawContent)
+                        }
+                    }
+                    res.onSuccess { (updated, summary) ->
+                        current = updated
+                        successCount++
+                        addedTotal += summary.addedCount
+                        removedTotal += summary.removedCount
+                    }.onFailure {
+                        failCount++
+                    }
+                }
+                runCatching {
+                    val saved = repository.saveProfile(current)
+                    val list = repository.listProfiles()
+                    val compiled = withContext(Dispatchers.Default) {
+                        ConfigEngine.compileConfig(saved)
+                    }
+                    val failNote = if (failCount > 0) "，$failCount 个失败" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "全部节点订阅更新完成：成功 $successCount 个$failNote（+$addedTotal/-$removedTotal 节点）"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "保存订阅更新失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun deleteNodeSubscription(subscriptionId: String, removeNodes: Boolean) {
+        val profile = _uiState.value.activeProfile ?: return
+        val sub = profile.nodeSubscriptions.firstOrNull { it.id == subscriptionId } ?: return
+        val updated = ConfigEngine.removeNodeSubscription(profile, subscriptionId, removeNodes)
+        val msg = if (removeNodes) {
+            "已删除订阅「${sub.name}」及其节点"
+        } else {
+            "已删除订阅「${sub.name}」，节点已保留为自定义节点"
+        }
+        mutateActiveProfile(updated, msg)
+    }
+
     // --- Node & Direct `dialer-proxy` Operations ---
 
     fun addNodeFromUri(uriText: String) {
@@ -323,7 +482,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         val profile = _uiState.value.activeProfile ?: return
         val existing = profile.proxies.firstOrNull { it.id == nodeId } ?: return
         runCatching {
-            val parsed = ConfigEngine.parseNodeFromYaml(newRawYaml, existing.source).copy(id = nodeId)
+            val parsed = ConfigEngine.parseNodeFromYaml(newRawYaml, existing.source, existing.subscriptionId).copy(id = nodeId)
             var updatedProxies = profile.proxies.map { if (it.id == nodeId) parsed else it }
             var updatedGroups = profile.proxyGroups
             if (existing.name != parsed.name) {
@@ -415,8 +574,23 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         val cleanedGroups = removeMemberFromGroups(profile.proxyGroups, target.name)
+        val updatedSubs = if (target.subscriptionId != null) {
+            profile.nodeSubscriptions.map { sub ->
+                if (sub.id == target.subscriptionId) {
+                    sub.copy(nodeCount = remainingProxies.count { it.subscriptionId == sub.id })
+                } else {
+                    sub
+                }
+            }
+        } else {
+            profile.nodeSubscriptions
+        }
         mutateActiveProfile(
-            profile.copy(proxies = remainingProxies, proxyGroups = cleanedGroups),
+            profile.copy(
+                proxies = remainingProxies,
+                proxyGroups = cleanedGroups,
+                nodeSubscriptions = updatedSubs
+            ),
             "已删除节点「${target.name}」并同步清理策略组引用"
         )
     }
@@ -453,9 +627,10 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             listOf(built) + profile.proxyGroups
         }
 
-        // If renamed, cascade to other groups, rules, and node dialer-proxy
+        // If renamed, cascade to other groups, rules, node dialer-proxy, and nodeSubscriptions
         var updatedProxies = profile.proxies
         var updatedRules = profile.rules
+        var updatedSubs = profile.nodeSubscriptions
         if (oldGroup != null && oldGroup.name != built.name) {
             updatedGroups = replaceMemberInGroups(updatedGroups, oldGroup.name, built.name)
             updatedProxies = updatedProxies.map { n ->
@@ -468,10 +643,22 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             updatedRules = updatedRules.map { r ->
                 if (r.target == oldGroup.name) r.copy(target = built.name) else r
             }
+            updatedSubs = updatedSubs.map { sub ->
+                if (oldGroup.name in sub.autoAddToGroups) {
+                    sub.copy(autoAddToGroups = sub.autoAddToGroups.map { if (it == oldGroup.name) built.name else it }.distinct())
+                } else {
+                    sub
+                }
+            }
         }
 
         mutateActiveProfile(
-            profile.copy(proxies = updatedProxies, proxyGroups = updatedGroups, rules = updatedRules),
+            profile.copy(
+                proxies = updatedProxies,
+                proxyGroups = updatedGroups,
+                rules = updatedRules,
+                nodeSubscriptions = updatedSubs
+            ),
             if (exists) "策略组已更新" else "已新建策略组：${built.name}"
         )
     }
@@ -501,8 +688,19 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 n
             }
         }
+        val updatedSubs = profile.nodeSubscriptions.map { sub ->
+            if (target.name in sub.autoAddToGroups) {
+                sub.copy(autoAddToGroups = sub.autoAddToGroups.filterNot { it == target.name })
+            } else {
+                sub
+            }
+        }
         mutateActiveProfile(
-            profile.copy(proxies = updatedProxies, proxyGroups = remainingGroups),
+            profile.copy(
+                proxies = updatedProxies,
+                proxyGroups = remainingGroups,
+                nodeSubscriptions = updatedSubs
+            ),
             "已删除策略组「${target.name}」"
         )
     }

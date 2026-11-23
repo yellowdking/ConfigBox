@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentPaste
@@ -198,7 +200,7 @@ private fun ImportActionsCard(
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "导入后自动分离 proxies / proxy-groups / rules / 基础设置，可独立修改与组装中转组。",
+                text = "导入后自动分离 proxies / proxy-groups / rules / 基础设置，可在「节点 → 节点订阅」中继续叠加多个外部订阅源。",
                 fontSize = 12.sp,
                 color = SlateMuted
             )
@@ -321,8 +323,16 @@ private fun ProfileCard(
                 }
             }
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 StatChip("${profile.nodeCount} 节点")
+                if (profile.subscriptionCount > 0) {
+                    StatChip("${profile.subscriptionCount} 节点订阅")
+                }
                 StatChip("${profile.groupCount} 策略组")
                 StatChip("${profile.ruleCount} 规则")
                 StatChip("${profile.relayBoundCount} 已中转")
@@ -372,7 +382,7 @@ private fun ImportUrlDialog(
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
-                    label = { Text("Clash 订阅链接 (HTTP/HTTPS)") },
+                    label = { Text("订阅链接 (支持 Clash YAML / Base64 / URI)") },
                     placeholder = { Text("https://...") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
@@ -416,7 +426,7 @@ private fun ImportPasteDialog(
                 OutlinedTextField(
                     value = yaml,
                     onValueChange = { yaml = it },
-                    label = { Text("YAML 内容") },
+                    label = { Text("YAML / Base64 / 节点 URI 内容") },
                     minLines = 6,
                     maxLines = 12,
                     modifier = Modifier.fillMaxWidth()

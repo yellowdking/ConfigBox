@@ -1,6 +1,7 @@
 package com.configbox.app.engine
 
 import com.configbox.app.model.NodeSource
+import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.ProxyNode
@@ -8,10 +9,23 @@ import com.configbox.app.model.RuleEntry
 import com.configbox.app.model.SplitProfile
 import java.util.UUID
 
+data class SubscriptionParseResult(
+    val nodes: List<ProxyNode>,
+    val skippedCount: Int = 0
+)
+
+data class SubscriptionSyncSummary(
+    val totalNodes: Int,
+    val addedCount: Int,
+    val removedCount: Int,
+    val skippedCount: Int
+)
+
 /**
  * Core engine responsible for:
- * 1. Splitting an imported Clash/Mihomo YAML into independent modules (base, proxies, proxy-groups, rules, rule-providers).
- * 2. Refreshing subscription nodes without clobbering custom nodes, custom proxy groups, rule edits, or node `dialer-proxy` bindings.
+ * 1. Splitting an imported Clash/Mihomo YAML (or Base64/URI subscription) into independent modules.
+ * 2. Managing primary and extra [NodeSubscription] sources without clobbering custom nodes,
+ *    other subscriptions, custom proxy groups, rule edits, or node `dialer-proxy` bindings.
  * 3. Compiling all modules cleanly back into a valid Mihomo/Clash YAML without injecting hidden duplicate nodes or groups.
  */
 object ConfigEngine {
@@ -25,8 +39,62 @@ object ConfigEngine {
         profileName: String,
         subscriptionUrl: String = ""
     ): SplitProfile {
-        val root = YamlCodec.parseMap(rawYaml)
+        val cleaned = rawYaml.removePrefix("\uFEFF").trim()
+        val parsedMap = runCatching { YamlCodec.parseMap(cleaned) }.getOrNull()
 
+        // If the imported text is a Clash/Mihomo YAML map, split it losslessly.
+        if (parsedMap != null && (parsedMap.containsKey("proxies") || parsedMap.containsKey("proxy-groups") || parsedMap.containsKey("rules") || !ProxyUriParser.looksLikeUriList(cleaned))) {
+            return splitClashMap(parsedMap, profileName, subscriptionUrl)
+        }
+
+        // Fallback: allow importing a Base64 or plaintext proxy-URI subscription directly as a profile.
+        val parsed = parseSubscriptionNodes(cleaned, subscriptionId = null, namePrefix = "")
+        val proxies = deduplicateNodes(parsed.nodes)
+        val nodeNames = proxies.map { it.name }
+        val autoGroup = buildProxyGroup(
+            name = "♻️ 自动测速",
+            type = "url-test",
+            proxies = nodeNames
+        )
+        val selectGroup = buildProxyGroup(
+            name = "🚀 节点选择",
+            type = "select",
+            proxies = listOf("♻️ 自动测速") + nodeNames + listOf("DIRECT")
+        )
+        val groups = listOf(selectGroup, autoGroup)
+        val rules = listOf(
+            RuleEntry(type = "GEOIP", payload = "LAN", target = "DIRECT", noResolve = true),
+            RuleEntry(type = "GEOIP", payload = "CN", target = "DIRECT"),
+            RuleEntry(type = "MATCH", payload = "", target = "🚀 节点选择")
+        )
+        val now = System.currentTimeMillis()
+        val meta = ProfileMeta(
+            name = profileName.ifBlank { "订阅配置" },
+            subscriptionUrl = subscriptionUrl.trim(),
+            createdAt = now,
+            updatedAt = now,
+            nodeCount = proxies.size,
+            groupCount = groups.size,
+            ruleCount = rules.size,
+            relayBoundCount = 0,
+            subscriptionCount = 0
+        )
+        return SplitProfile(
+            meta = meta,
+            baseConfigYaml = defaultBaseYaml(),
+            proxies = proxies,
+            proxyGroups = groups,
+            rules = rules,
+            ruleProvidersYaml = "",
+            nodeSubscriptions = emptyList()
+        )
+    }
+
+    private fun splitClashMap(
+        root: LinkedHashMap<String, Any?>,
+        profileName: String,
+        subscriptionUrl: String
+    ): SplitProfile {
         val baseMap = LinkedHashMap<String, Any?>()
         for ((key, value) in root) {
             if (key !in SPLIT_KEYS) {
@@ -38,7 +106,7 @@ object ConfigEngine {
         val rawProxies = (root["proxies"] as? List<*>) ?: emptyList<Any?>()
         val parsedProxies = rawProxies.mapNotNull { item ->
             val map = item as? Map<*, *> ?: return@mapNotNull null
-            mapToProxyNode(map, NodeSource.SUBSCRIPTION)
+            mapToProxyNode(map, NodeSource.SUBSCRIPTION, subscriptionId = null)
         }
         val proxies = deduplicateNodes(parsedProxies)
 
@@ -70,7 +138,8 @@ object ConfigEngine {
             nodeCount = proxies.size,
             groupCount = groups.size,
             ruleCount = rules.size,
-            relayBoundCount = proxies.count { !it.dialerProxy.isNullOrBlank() }
+            relayBoundCount = proxies.count { !it.dialerProxy.isNullOrBlank() },
+            subscriptionCount = 0
         )
 
         return SplitProfile(
@@ -79,13 +148,104 @@ object ConfigEngine {
             proxies = proxies,
             proxyGroups = groups,
             rules = rules,
-            ruleProvidersYaml = ruleProvidersYaml
+            ruleProvidersYaml = ruleProvidersYaml,
+            nodeSubscriptions = emptyList()
         )
     }
 
     /**
-     * Refreshes ONLY subscription-sourced nodes while preserving:
+     * Parses nodes from a remote or pasted subscription payload.
+     * Supports:
+     * 1. Clash / Mihomo YAML (`proxies: [...]`)
+     * 2. Plaintext newline-separated proxy URIs (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `socks5://`, `http://`)
+     * 3. Base64-encoded proxy URI lists or Base64-encoded Clash YAML
+     */
+    fun parseSubscriptionNodes(
+        rawContent: String,
+        subscriptionId: String? = null,
+        namePrefix: String = ""
+    ): SubscriptionParseResult {
+        val cleaned = rawContent.removePrefix("\uFEFF").trim()
+        if (cleaned.isBlank()) {
+            throw IllegalArgumentException("订阅内容为空")
+        }
+
+        // 1. Try Clash/Mihomo YAML with `proxies:`
+        val yamlNodes = extractNodesFromClashYaml(cleaned, subscriptionId)
+        if (yamlNodes != null) {
+            if (yamlNodes.isEmpty()) {
+                throw IllegalArgumentException("订阅 YAML 中未找到任何有效节点")
+            }
+            val prefixed = applyPrefixAndSubTag(yamlNodes, subscriptionId, namePrefix)
+            return SubscriptionParseResult(nodes = deduplicateNodes(prefixed), skippedCount = 0)
+        }
+
+        // 2. Try plaintext URI lines
+        if (ProxyUriParser.looksLikeUriList(cleaned)) {
+            val (parsed, skipped) = ProxyUriParser.parseBatchLenient(cleaned)
+            if (parsed.isNotEmpty()) {
+                val tagged = applyPrefixAndSubTag(parsed, subscriptionId, namePrefix)
+                return SubscriptionParseResult(nodes = deduplicateNodes(tagged), skippedCount = skipped)
+            }
+        }
+
+        // 3. Try Base64-decoded payload (either URI list or Clash YAML)
+        val decoded = ProxyUriParser.tryDecodeBase64Subscription(cleaned)
+        if (!decoded.isNullOrBlank()) {
+            val decodedYamlNodes = extractNodesFromClashYaml(decoded, subscriptionId)
+            if (decodedYamlNodes != null && decodedYamlNodes.isNotEmpty()) {
+                val prefixed = applyPrefixAndSubTag(decodedYamlNodes, subscriptionId, namePrefix)
+                return SubscriptionParseResult(nodes = deduplicateNodes(prefixed), skippedCount = 0)
+            }
+            if (ProxyUriParser.looksLikeUriList(decoded)) {
+                val (parsed, skipped) = ProxyUriParser.parseBatchLenient(decoded)
+                if (parsed.isNotEmpty()) {
+                    val tagged = applyPrefixAndSubTag(parsed, subscriptionId, namePrefix)
+                    return SubscriptionParseResult(nodes = deduplicateNodes(tagged), skippedCount = skipped)
+                }
+            }
+        }
+
+        throw IllegalArgumentException("无法识别订阅格式（支持 Clash YAML、Base64 节点订阅及纯文本 URI 列表）")
+    }
+
+    private fun extractNodesFromClashYaml(text: String, subscriptionId: String?): List<ProxyNode>? {
+        val map = runCatching { YamlCodec.parseMap(text) }.getOrNull() ?: return null
+        val rawProxies = map["proxies"] as? List<*> ?: return null
+        return rawProxies.mapNotNull { item ->
+            val proxyMap = item as? Map<*, *> ?: return@mapNotNull null
+            mapToProxyNode(proxyMap, NodeSource.SUBSCRIPTION, subscriptionId = subscriptionId)
+        }
+    }
+
+    private fun applyPrefixAndSubTag(
+        nodes: List<ProxyNode>,
+        subscriptionId: String?,
+        namePrefix: String
+    ): List<ProxyNode> {
+        val cleanPrefix = if (namePrefix.isBlank()) "" else namePrefix.trimStart()
+        return nodes.map { node ->
+            val targetName = if (cleanPrefix.isNotEmpty() && !node.name.startsWith(cleanPrefix)) {
+                "$cleanPrefix${node.name}"
+            } else {
+                node.name
+            }
+            val tagged = node.copy(
+                source = NodeSource.SUBSCRIPTION,
+                subscriptionId = subscriptionId
+            )
+            if (targetName != tagged.name) {
+                updateNodeBasicFields(tagged, targetName, tagged.server, tagged.port, tagged.udp, tagged.dialerProxy)
+            } else {
+                tagged
+            }
+        }
+    }
+
+    /**
+     * Refreshes ONLY primary-profile subscription nodes (`source == SUBSCRIPTION && subscriptionId == null`) while preserving:
      * - all user-added CUSTOM nodes
+     * - all extra [NodeSubscription] nodes (`subscriptionId != null`)
      * - all existing `dialer-proxy` bindings by node name
      * - user-defined relative node order for surviving nodes
      * - all user-edited proxy-groups & rules
@@ -94,24 +254,28 @@ object ConfigEngine {
         existing: SplitProfile,
         freshRawYaml: String
     ): SplitProfile {
-        val fresh = splitConfig(freshRawYaml, existing.meta.name, existing.meta.subscriptionUrl)
+        val parsed = parseSubscriptionNodes(freshRawYaml, subscriptionId = null, namePrefix = "")
         val savedDialerByName = existing.proxies
             .filter { !it.dialerProxy.isNullOrBlank() }
             .associate { it.name to it.dialerProxy }
 
-        val refreshedSubNodes = fresh.proxies.map { node ->
-            val savedDialer = savedDialerByName[node.name]
-            if (!savedDialer.isNullOrBlank() && savedDialer != node.name) {
-                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, savedDialer)
+        val preservedOtherNodes = existing.proxies.filter {
+            it.source == NodeSource.CUSTOM || it.subscriptionId != null
+        }
+        val reservedNames = preservedOtherNodes.map { it.name }.toMutableSet()
+
+        val refreshedPrimaryNodes = parsed.nodes.map { candidate ->
+            val unique = ensureUniqueNodeName(candidate, reservedNames)
+            reservedNames.add(unique.name)
+            val savedDialer = savedDialerByName[unique.name]
+            if (!savedDialer.isNullOrBlank() && savedDialer != unique.name) {
+                updateNodeBasicFields(unique, unique.name, unique.server, unique.port, unique.udp, savedDialer)
             } else {
-                node
+                unique
             }
         }
 
-        val customNodes = existing.proxies.filter { it.source == NodeSource.CUSTOM }
-        val freshSubNames = refreshedSubNodes.map { it.name }.toSet()
-        val combined = refreshedSubNodes + customNodes.filter { it.name !in freshSubNames }
-
+        val combined = refreshedPrimaryNodes + preservedOtherNodes
         val existingOrder = existing.proxies.withIndex().associate { it.value.name to it.index }
         val mergedNodes = combined.sortedBy { existingOrder[it.name] ?: Int.MAX_VALUE }
 
@@ -121,7 +285,205 @@ object ConfigEngine {
                 updatedAt = System.currentTimeMillis(),
                 nodeCount = mergedNodes.size,
                 groupCount = existing.proxyGroups.size,
-                relayBoundCount = mergedNodes.count { !it.dialerProxy.isNullOrBlank() }
+                relayBoundCount = mergedNodes.count { !it.dialerProxy.isNullOrBlank() },
+                subscriptionCount = existing.nodeSubscriptions.size
+            )
+        )
+    }
+
+    /**
+     * Adds or refreshes an extra [NodeSubscription] on [existing]:
+     * - Replaces ONLY nodes belonging to `subscription.id`
+     * - Preserves primary subscription nodes, other node subscriptions, custom nodes, rules, and `dialer-proxy` bindings
+     * - Automatically prunes removed nodes of this subscription from proxy groups
+     * - Automatically appends fetched nodes to any proxy group listed in `subscription.autoAddToGroups`
+     */
+    fun applyNodeSubscription(
+        existing: SplitProfile,
+        subscription: NodeSubscription,
+        rawContent: String
+    ): Pair<SplitProfile, SubscriptionSyncSummary> {
+        val parseResult = parseSubscriptionNodes(
+            rawContent = rawContent,
+            subscriptionId = subscription.id,
+            namePrefix = subscription.namePrefix
+        )
+
+        val oldSubNodes = existing.proxies.filter { it.subscriptionId == subscription.id }
+        val oldSubNames = oldSubNodes.map { it.name }.toSet()
+        val savedDialerByName = oldSubNodes
+            .filter { !it.dialerProxy.isNullOrBlank() }
+            .associate { it.name to it.dialerProxy }
+
+        val otherNodes = existing.proxies.filter { it.subscriptionId != subscription.id }
+        val reservedNames = otherNodes.map { it.name }.toMutableSet()
+
+        val syncedSubNodes = parseResult.nodes.map { candidate ->
+            val unique = ensureUniqueNodeName(candidate, reservedNames)
+            reservedNames.add(unique.name)
+            val savedDialer = savedDialerByName[unique.name]
+            if (!savedDialer.isNullOrBlank() && savedDialer != unique.name) {
+                updateNodeBasicFields(unique, unique.name, unique.server, unique.port, unique.udp, savedDialer)
+            } else {
+                unique
+            }
+        }
+
+        val newSubNames = syncedSubNodes.map { it.name }.toSet()
+        val removedNames = oldSubNames - newSubNames
+        val addedCount = (newSubNames - oldSubNames).size
+
+        // Preserve relative order of surviving nodes; append newly discovered nodes cleanly
+        val existingOrder = existing.proxies.withIndex().associate { it.value.name to it.index }
+        val cleanedOtherNodes = if (removedNames.isEmpty()) {
+            otherNodes
+        } else {
+            otherNodes.map { n ->
+                if (n.dialerProxy in removedNames) {
+                    updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, null)
+                } else {
+                    n
+                }
+            }
+        }
+        val mergedNodes = (cleanedOtherNodes + syncedSubNodes)
+            .sortedBy { existingOrder[it.name] ?: Int.MAX_VALUE }
+
+        val targetGroups = subscription.autoAddToGroups.toSet()
+        val syncedOrderedNames = syncedSubNodes.map { it.name }
+        val updatedGroups = existing.proxyGroups.map { group ->
+            var members = group.proxies
+            var changed = false
+            if (removedNames.isNotEmpty() && members.any { it in removedNames }) {
+                members = members.filterNot { it in removedNames }
+                changed = true
+            }
+            if (group.name in targetGroups) {
+                val existingMemberSet = members.toSet()
+                val toAppend = syncedOrderedNames.filter { it !in existingMemberSet }
+                if (toAppend.isNotEmpty()) {
+                    members = members + toAppend
+                    changed = true
+                }
+            }
+            if (changed) {
+                buildProxyGroup(
+                    id = group.id,
+                    name = group.name,
+                    type = group.type,
+                    proxies = members,
+                    url = group.url,
+                    interval = group.interval,
+                    existingRawYaml = group.rawYaml
+                )
+            } else {
+                group
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        val updatedSub = subscription.copy(
+            name = subscription.name.trim().ifBlank { "节点订阅" },
+            url = subscription.url.trim(),
+            namePrefix = if (subscription.namePrefix.isBlank()) "" else subscription.namePrefix.trimStart(),
+            lastUpdatedAt = now,
+            nodeCount = syncedSubNodes.size
+        )
+        val subExists = existing.nodeSubscriptions.any { it.id == updatedSub.id }
+        val updatedSubs = if (subExists) {
+            existing.nodeSubscriptions.map { if (it.id == updatedSub.id) updatedSub else it }
+        } else {
+            listOf(updatedSub) + existing.nodeSubscriptions
+        }
+
+        val updatedProfile = existing.copy(
+            proxies = mergedNodes,
+            proxyGroups = updatedGroups,
+            nodeSubscriptions = updatedSubs,
+            meta = existing.meta.copy(
+                updatedAt = now,
+                nodeCount = mergedNodes.size,
+                groupCount = updatedGroups.size,
+                relayBoundCount = mergedNodes.count { !it.dialerProxy.isNullOrBlank() },
+                subscriptionCount = updatedSubs.size
+            )
+        )
+        val summary = SubscriptionSyncSummary(
+            totalNodes = syncedSubNodes.size,
+            addedCount = addedCount,
+            removedCount = removedNames.size,
+            skippedCount = parseResult.skippedCount
+        )
+        return updatedProfile to summary
+    }
+
+    /**
+     * Removes a [NodeSubscription] from [existing].
+     * When [removeNodes] is true, its nodes are deleted and pruned from all proxy groups & dialer-proxy links.
+     * When [removeNodes] is false, its nodes are kept and converted to [NodeSource.CUSTOM].
+     */
+    fun removeNodeSubscription(
+        existing: SplitProfile,
+        subscriptionId: String,
+        removeNodes: Boolean
+    ): SplitProfile {
+        val remainingSubs = existing.nodeSubscriptions.filterNot { it.id == subscriptionId }
+        val removedNames = if (removeNodes) {
+            existing.proxies.filter { it.subscriptionId == subscriptionId }.map { it.name }.toSet()
+        } else {
+            emptySet()
+        }
+
+        val updatedNodes = if (removeNodes) {
+            existing.proxies
+                .filterNot { it.subscriptionId == subscriptionId }
+                .map { n ->
+                    if (n.dialerProxy in removedNames) {
+                        updateNodeBasicFields(n, n.name, n.server, n.port, n.udp, null)
+                    } else {
+                        n
+                    }
+                }
+        } else {
+            existing.proxies.map { n ->
+                if (n.subscriptionId == subscriptionId) {
+                    n.copy(source = NodeSource.CUSTOM, subscriptionId = null)
+                } else {
+                    n
+                }
+            }
+        }
+
+        val updatedGroups = if (removedNames.isEmpty()) {
+            existing.proxyGroups
+        } else {
+            existing.proxyGroups.map { group ->
+                if (group.proxies.any { it in removedNames }) {
+                    buildProxyGroup(
+                        id = group.id,
+                        name = group.name,
+                        type = group.type,
+                        proxies = group.proxies.filterNot { it in removedNames },
+                        url = group.url,
+                        interval = group.interval,
+                        existingRawYaml = group.rawYaml
+                    )
+                } else {
+                    group
+                }
+            }
+        }
+
+        return existing.copy(
+            proxies = updatedNodes,
+            proxyGroups = updatedGroups,
+            nodeSubscriptions = remainingSubs,
+            meta = existing.meta.copy(
+                updatedAt = System.currentTimeMillis(),
+                nodeCount = updatedNodes.size,
+                groupCount = updatedGroups.size,
+                relayBoundCount = updatedNodes.count { !it.dialerProxy.isNullOrBlank() },
+                subscriptionCount = remainingSubs.size
             )
         )
     }
@@ -361,9 +723,13 @@ object ConfigEngine {
         }
     }
 
-    fun parseNodeFromYaml(yamlText: String, source: NodeSource = NodeSource.CUSTOM): ProxyNode {
+    fun parseNodeFromYaml(
+        yamlText: String,
+        source: NodeSource = NodeSource.CUSTOM,
+        subscriptionId: String? = null
+    ): ProxyNode {
         val map = YamlCodec.parseMap(yamlText)
-        return mapToProxyNode(map, source)
+        return mapToProxyNode(map, source, subscriptionId)
             ?: throw IllegalArgumentException("节点 YAML 缺少必要字段（name / type / server / port）")
     }
 
@@ -398,7 +764,11 @@ object ConfigEngine {
         )
     }
 
-    private fun mapToProxyNode(map: Map<*, *>, source: NodeSource): ProxyNode? {
+    private fun mapToProxyNode(
+        map: Map<*, *>,
+        source: NodeSource,
+        subscriptionId: String? = null
+    ): ProxyNode? {
         val normalized = LinkedHashMap<String, Any?>()
         for ((k, v) in map) {
             if (k != null) normalized[k.toString()] = YamlCodec.deepCopy(v)
@@ -418,6 +788,7 @@ object ConfigEngine {
             udp = udp,
             dialerProxy = dialerProxy,
             source = source,
+            subscriptionId = subscriptionId,
             rawYaml = YamlCodec.dump(normalized)
         )
     }

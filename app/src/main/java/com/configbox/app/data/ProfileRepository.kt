@@ -4,6 +4,7 @@ import android.content.Context
 import com.configbox.app.engine.ConfigEngine
 import com.configbox.app.engine.YamlCodec
 import com.configbox.app.model.NodeSource
+import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.model.ProxyNode
@@ -26,11 +27,13 @@ import java.util.concurrent.TimeUnit
  *   filesDir/profiles/<profileId>/
  *     ├── meta.json
  *     ├── base.yaml
- *     ├── proxies.yaml         (subscription nodes)
- *     ├── custom_proxies.yaml  (user-added / custom nodes)
- *     ├── node_order.json      (user-defined global node order)
- *     ├── groups.yaml          (editable proxy-groups)
- *     ├── rules.json           (editable rules)
+ *     ├── proxies.yaml            (subscription nodes)
+ *     ├── custom_proxies.yaml     (user-added / custom nodes)
+ *     ├── node_order.json         (user-defined global node order)
+ *     ├── node_subscriptions.json (extra node subscription sources)
+ *     ├── node_sub_map.json       (nodeName -> subscriptionId mapping)
+ *     ├── groups.yaml             (editable proxy-groups)
+ *     ├── rules.json              (editable rules)
  *     └── rule_providers.yaml
  */
 class ProfileRepository(context: Context) {
@@ -80,7 +83,19 @@ class ProfileRepository(context: Context) {
                 json.decodeFromString<ProfileMeta>(metaFile.readText())
             }.getOrNull() ?: return@withLock null
             val baseYaml = File(dir, "base.yaml").takeIf { it.exists() }?.readText() ?: ""
+            val nodeSubscriptions = File(dir, "node_subscriptions.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<List<NodeSubscription>>(it.readText()) }.getOrDefault(emptyList())
+            } ?: emptyList()
+            val validSubIds = nodeSubscriptions.map { it.id }.toSet()
+            val subMap = File(dir, "node_sub_map.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<Map<String, String>>(it.readText()) }.getOrDefault(emptyMap())
+            } ?: emptyMap()
+
             val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
+                .map { node ->
+                    val subId = subMap[node.name]?.takeIf { it in validSubIds }
+                    if (subId != null) node.copy(subscriptionId = subId) else node
+                }
             val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
             val combined = subProxies + customProxies
 
@@ -106,13 +121,15 @@ class ProfileRepository(context: Context) {
                     nodeCount = allProxies.size,
                     groupCount = groups.size,
                     ruleCount = rules.size,
-                    relayBoundCount = allProxies.count { !it.dialerProxy.isNullOrBlank() }
+                    relayBoundCount = allProxies.count { !it.dialerProxy.isNullOrBlank() },
+                    subscriptionCount = nodeSubscriptions.size
                 ),
                 baseConfigYaml = baseYaml,
                 proxies = allProxies,
                 proxyGroups = groups,
                 rules = rules,
-                ruleProvidersYaml = ruleProvidersYaml
+                ruleProvidersYaml = ruleProvidersYaml,
+                nodeSubscriptions = nodeSubscriptions
             )
         }
     }
@@ -124,7 +141,8 @@ class ProfileRepository(context: Context) {
                 nodeCount = profile.proxies.size,
                 groupCount = profile.proxyGroups.size,
                 ruleCount = profile.rules.size,
-                relayBoundCount = profile.proxies.count { !it.dialerProxy.isNullOrBlank() }
+                relayBoundCount = profile.proxies.count { !it.dialerProxy.isNullOrBlank() },
+                subscriptionCount = profile.nodeSubscriptions.size
             )
             val updated = profile.copy(meta = updatedMeta)
             val dir = resolveProfileDir(updatedMeta.id).apply { mkdirs() }
@@ -137,6 +155,12 @@ class ProfileRepository(context: Context) {
             writeProxyListFile(File(dir, "proxies.yaml"), subNodes)
             writeProxyListFile(File(dir, "custom_proxies.yaml"), customNodes)
             writeTextAtomic(File(dir, "node_order.json"), json.encodeToString(updated.proxies.map { it.name }))
+
+            writeTextAtomic(File(dir, "node_subscriptions.json"), json.encodeToString(updated.nodeSubscriptions))
+            val subMap = updated.proxies
+                .mapNotNull { node -> node.subscriptionId?.let { node.name to it } }
+                .toMap()
+            writeTextAtomic(File(dir, "node_sub_map.json"), json.encodeToString(subMap))
 
             writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
             writeTextAtomic(File(dir, "rules.json"), json.encodeToString(updated.rules))
@@ -167,7 +191,7 @@ class ProfileRepository(context: Context) {
             if (!response.isSuccessful) {
                 throw IllegalStateException("订阅拉取失败：HTTP ${response.code}")
             }
-            val body = response.body?.string()
+            val body = response.body?.string()?.removePrefix("\uFEFF")
             if (body.isNullOrBlank()) {
                 throw IllegalStateException("订阅返回内容为空")
             }
