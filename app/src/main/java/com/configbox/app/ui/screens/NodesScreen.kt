@@ -1829,7 +1829,7 @@ private fun GlobalNodePoolPane(
             matchSrc && matchProto && matchQ
         }
         if (sortByLatency) {
-            base.sortedBy { poolLatencies[it.key]?.latencyMs ?: Int.MAX_VALUE }
+            base.sortedBy { poolLatencies[it.key]?.latencyMs ?: Long.MAX_VALUE }
         } else {
             base
         }
