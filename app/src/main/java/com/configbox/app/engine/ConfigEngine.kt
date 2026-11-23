@@ -897,13 +897,19 @@ object ConfigEngine {
     fun buildGlobalNodePool(allProfiles: List<SplitProfile>): List<GlobalPoolNode> {
         val ordered = allProfiles.sortedBy { if (it.meta.isComposed) 1 else 0 }
         val seenFingerprints = mutableSetOf<String>()
+        val seenOriginAndName = mutableSetOf<String>()
         val result = mutableListOf<GlobalPoolNode>()
         for (profile in ordered) {
             for (node in profile.proxies) {
-                val fp = "${node.name.trim()}|${node.type.lowercase()}|${node.server.lowercase()}|${node.port}"
-                if (!seenFingerprints.add(fp)) continue
                 val originId = node.originProfileId?.takeIf { it.isNotBlank() } ?: profile.meta.id
                 val originName = node.originProfileName?.takeIf { it.isNotBlank() } ?: profile.meta.name
+                val originKey = "$originId::${node.name.trim()}"
+                // If a source (non-composed) profile already provides this origin node,
+                // skip stale copies carried inside composed profiles even after server/port updates.
+                if (profile.meta.isComposed && originKey in seenOriginAndName) continue
+                val fp = "${node.name.trim()}|${node.type.lowercase()}|${node.server.lowercase()}|${node.port}"
+                if (!seenFingerprints.add(fp)) continue
+                seenOriginAndName.add(originKey)
                 val key = "${profile.meta.id}::${node.id}"
                 result.add(
                     GlobalPoolNode(
@@ -1150,8 +1156,13 @@ object ConfigEngine {
         target: SplitProfile,
         globalPool: List<GlobalPoolNode>
     ): Pair<SplitProfile, Int> {
-        val byOriginAndName = globalPool.associateBy { "${it.originProfileId}::${it.node.name}" }
-        val byName = globalPool.associateBy { it.node.name }
+        val externalPool = globalPool.filterNot { it.key.startsWith("${target.meta.id}::") }
+        val byOriginAndName = LinkedHashMap<String, GlobalPoolNode>()
+        val byName = LinkedHashMap<String, GlobalPoolNode>()
+        for (entry in externalPool) {
+            byOriginAndName.putIfAbsent("${entry.originProfileId}::${entry.node.name}", entry)
+            byName.putIfAbsent(entry.node.name, entry)
+        }
         var syncedCount = 0
 
         val refreshedNodes = target.proxies.map { node ->
