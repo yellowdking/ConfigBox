@@ -83,29 +83,28 @@ fun RulesScreen(
     viewModel: ConfigBoxViewModel
 ) {
     val active = uiState.activeProfile
-    if (active == null) {
-        EmptyProfileNotice("请先在「配置」页导入或选择一个 Clash 配置文件")
-        return
-    }
+    val activeId = active?.meta?.id
+    val rules = active?.rules.orEmpty()
+    val proxyGroups = active?.proxyGroups.orEmpty()
 
     var searchQuery by remember { mutableStateOf("") }
     var editingRule by remember { mutableStateOf<RuleEntry?>(null) }
     var isAddingNew by remember { mutableStateOf(false) }
     var showMixinDialog by remember { mutableStateOf(false) }
 
-    val donorProfiles = remember(uiState.allProfiles, active.meta.id) {
-        uiState.allProfiles.filter { it.meta.id != active.meta.id && it.rules.isNotEmpty() }
+    val donorProfiles = remember(uiState.allProfiles, activeId) {
+        uiState.allProfiles.filter { it.meta.id != activeId && it.rules.isNotEmpty() }
     }
 
-    val availableTargets = remember(active.proxyGroups) {
-        (active.proxyGroups.map { it.name } + listOf("DIRECT", "REJECT")).distinct()
+    val availableTargets = remember(proxyGroups) {
+        (proxyGroups.map { it.name } + listOf("DIRECT", "REJECT")).distinct()
     }
 
-    val filteredRules = remember(active.rules, searchQuery) {
+    val filteredRules = remember(rules, searchQuery) {
         if (searchQuery.isBlank()) {
-            active.rules
+            rules
         } else {
-            active.rules.filter { rule ->
+            rules.filter { rule ->
                 rule.payload.contains(searchQuery, ignoreCase = true) ||
                     rule.target.contains(searchQuery, ignoreCase = true) ||
                     rule.type.contains(searchQuery, ignoreCase = true)
@@ -134,14 +133,18 @@ fun RulesScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 item {
-                    val enabledCount = active.rules.count { it.enabled }
+                    val enabledCount = rules.count { it.enabled }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "共 ${active.rules.size} 条规则（启用 $enabledCount 条）",
+                            text = if (active == null) {
+                                "尚未导入配置，点右下角「+」可直接添加规则"
+                            } else {
+                                "共 ${rules.size} 条规则（启用 $enabledCount 条）"
+                            },
                             style = MaterialTheme.typography.labelMedium,
                             modifier = Modifier.weight(1f)
                         )
@@ -155,6 +158,43 @@ fun RulesScreen(
                                 Icon(Icons.Outlined.MergeType, null, Modifier.size(15.dp), tint = SkyAccent)
                                 Spacer(Modifier.width(4.dp))
                                 Text("从配置池混入", fontSize = 12.sp, color = SlateInk)
+                            }
+                        }
+                    }
+                }
+
+                if (rules.isEmpty()) {
+                    item {
+                        Surface(
+                            color = PureWhite,
+                            border = BorderStroke(1.dp, BorderGray),
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(18.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text("暂无分流规则", style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    text = "可直接添加域名 / IP / GEOIP / RULE-SET 等规则，无需先导入节点或订阅。",
+                                    fontSize = 12.sp,
+                                    color = SlateMuted
+                                )
+                                Button(
+                                    onClick = {
+                                        isAddingNew = true
+                                        editingRule = RuleEntry(
+                                            type = "DOMAIN-SUFFIX",
+                                            payload = "",
+                                            target = availableTargets.firstOrNull() ?: "DIRECT"
+                                        )
+                                    }
+                                ) {
+                                    Icon(Icons.Outlined.Add, null, Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("添加规则", fontSize = 12.sp)
+                                }
                             }
                         }
                     }

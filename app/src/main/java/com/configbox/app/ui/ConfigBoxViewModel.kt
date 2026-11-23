@@ -153,6 +153,11 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 val compiled = withContext(Dispatchers.Default) {
                     ConfigEngine.compileConfig(saved)
                 }
+                val msg = if (saved.proxies.isEmpty()) {
+                    "已导入无节点配置：0 节点 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则（可在「节点」页单独添加节点）"
+                } else {
+                    "已拆分入池：${saved.proxies.size} 节点加入节点池 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
+                }
                 _uiState.update {
                     it.copy(
                         profiles = list,
@@ -161,7 +166,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         activeProfile = saved,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "已拆分入池：${saved.proxies.size} 节点加入节点池 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
+                        snackbarMessage = msg
                     )
                 }
             }.onFailure { err ->
@@ -209,6 +214,50 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             name = "示例配置 (含家宽落地)",
             rawYaml = ConfigEngine.SAMPLE_CLASH_YAML
         )
+    }
+
+    fun createBlankProfile(
+        name: String = "自建配置",
+        withStarterTemplate: Boolean = true
+    ) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val blank = ConfigEngine.createBlankProfile(
+                        profileName = name,
+                        withStarterTemplate = withStarterTemplate
+                    )
+                    val saved = repository.saveProfile(blank)
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
+                    val compiled = withContext(Dispatchers.Default) {
+                        ConfigEngine.compileConfig(saved)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            nodeLatencies = emptyMap(),
+                            isLoading = false,
+                            snackbarMessage = "已新建配置「${saved.meta.name}」，可自由添加节点、策略组与规则"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "新建配置失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun getOrCreateActiveProfile(): Pair<SplitProfile, Boolean> {
+        val existing = _uiState.value.activeProfile
+        if (existing != null) return existing to false
+        return ConfigEngine.createBlankProfile("自建配置", withStarterTemplate = true) to true
     }
 
     fun refreshSubscriptionNodes(profileId: String) {
@@ -350,7 +399,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         if (poolKeys.isEmpty()) return
         viewModelScope.launch {
             mutationMutex.withLock {
-                val active = _uiState.value.activeProfile ?: return@withLock
+                val (active, _) = getOrCreateActiveProfile()
                 val poolByKey = _uiState.value.globalNodePool.associateBy { it.key }
                 val picked = poolKeys.mapNotNull { poolByKey[it] }
                 if (picked.isEmpty()) return@withLock
@@ -400,7 +449,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         if (selectedGroupNames.isEmpty() && selectedRuleIds.isEmpty()) return
         viewModelScope.launch {
             mutationMutex.withLock {
-                val active = _uiState.value.activeProfile ?: return@withLock
+                val (active, _) = getOrCreateActiveProfile()
                 if (active.meta.id == donorProfileId) return@withLock
                 _uiState.update { it.copy(isLoading = true) }
                 runCatching {
@@ -545,7 +594,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         }
         viewModelScope.launch {
             mutationMutex.withLock {
-                val profile = _uiState.value.activeProfile ?: return@withLock
+                val (profile, autoCreated) = getOrCreateActiveProfile()
                 _uiState.update { it.copy(isLoading = true) }
                 runCatching {
                     val sub = NodeSubscription(
@@ -987,7 +1036,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     // --- Node & Direct `dialer-proxy` Operations ---
 
     fun addNodeFromUri(uriText: String) {
-        val profile = _uiState.value.activeProfile ?: return
+        val (profile, autoCreated) = getOrCreateActiveProfile()
         runCatching {
             val parsedList = ProxyUriParser.parseBatch(uriText)
             if (parsedList.isEmpty()) throw IllegalArgumentException("请输入至少一条有效的节点 URI")
@@ -997,10 +1046,11 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 existingNames.add(unique.name)
                 unique
             }
+            val createdNote = if (autoCreated) "（已自动创建「${profile.meta.name}」并入节点池）" else ""
             val msg = if (deduped.size == 1) {
-                "已添加节点：${deduped.first().name}"
+                "已添加节点：${deduped.first().name}$createdNote"
             } else {
-                "已批量添加 ${deduped.size} 个节点"
+                "已批量添加 ${deduped.size} 个节点$createdNote"
             }
             mutateActiveProfile(profile.copy(proxies = deduped + profile.proxies), msg)
         }.onFailure { err ->
@@ -1009,7 +1059,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun addNodeFromYaml(yamlText: String) {
-        val profile = _uiState.value.activeProfile ?: return
+        val (profile, autoCreated) = getOrCreateActiveProfile()
         runCatching {
             val parsedList = ConfigEngine.parseNodesFromYaml(yamlText, NodeSource.CUSTOM)
             val existingNames = profile.proxies.map { it.name }.toMutableSet()
@@ -1018,10 +1068,11 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 existingNames.add(unique.name)
                 unique
             }
+            val createdNote = if (autoCreated) "（已自动创建「${profile.meta.name}」并入节点池）" else ""
             val msg = if (deduped.size == 1) {
-                "已添加节点：${deduped.first().name}"
+                "已添加节点：${deduped.first().name}$createdNote"
             } else {
-                "已批量添加 ${deduped.size} 个 YAML 节点"
+                "已批量添加 ${deduped.size} 个 YAML 节点$createdNote"
             }
             mutateActiveProfile(profile.copy(proxies = deduped + profile.proxies), msg)
         }.onFailure { err ->
@@ -1196,7 +1247,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         url: String?,
         interval: Int?
     ) {
-        val profile = _uiState.value.activeProfile ?: return
+        val (profile, autoCreated) = getOrCreateActiveProfile()
         val oldGroup = existingId?.let { id -> profile.proxyGroups.firstOrNull { it.id == id } }
         val built = if (existingId != null) {
             ConfigEngine.buildProxyGroup(
@@ -1299,8 +1350,9 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
     // --- Rule Operations ---
 
     fun addRule(rule: RuleEntry) {
-        val profile = _uiState.value.activeProfile ?: return
-        mutateActiveProfile(profile.copy(rules = listOf(rule) + profile.rules), "已添加规则")
+        val (profile, autoCreated) = getOrCreateActiveProfile()
+        val note = if (autoCreated) "（已自动创建「${profile.meta.name}」）" else ""
+        mutateActiveProfile(profile.copy(rules = listOf(rule) + profile.rules), "已添加规则$note")
     }
 
     fun updateRule(rule: RuleEntry) {

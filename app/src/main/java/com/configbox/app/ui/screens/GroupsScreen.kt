@@ -89,21 +89,20 @@ fun GroupsScreen(
     viewModel: ConfigBoxViewModel
 ) {
     val active = uiState.activeProfile
-    if (active == null) {
-        EmptyProfileNotice("请先在「配置」页导入或选择一个配置文件")
-        return
-    }
+    val activeId = active?.meta?.id
+    val groups = active?.proxyGroups.orEmpty()
+    val proxies = active?.proxies.orEmpty()
 
     var editingGroup by remember { mutableStateOf<ProxyGroupEntry?>(null) }
     var isNewGroup by remember { mutableStateOf(false) }
     var showMixinDialog by remember { mutableStateOf(false) }
 
-    val donorProfiles = remember(uiState.allProfiles, active.meta.id) {
-        uiState.allProfiles.filter { it.meta.id != active.meta.id && it.proxyGroups.isNotEmpty() }
+    val donorProfiles = remember(uiState.allProfiles, activeId) {
+        uiState.allProfiles.filter { it.meta.id != activeId && it.proxyGroups.isNotEmpty() }
     }
 
-    val relayedNodeNames = remember(active.proxies) {
-        active.proxies.filter { !it.dialerProxy.isNullOrBlank() }.map { it.name }.toSet()
+    val relayedNodeNames = remember(proxies) {
+        proxies.filter { !it.dialerProxy.isNullOrBlank() }.map { it.name }.toSet()
     }
 
     val groupListState = rememberLazyListState()
@@ -116,8 +115,8 @@ fun GroupsScreen(
                 .fillMaxSize()
                 .longPressReorderContainer(
                     reorderState = groupReorderState,
-                    enabled = true,
-                    itemCount = active.proxyGroups.size,
+                    enabled = groups.isNotEmpty(),
+                    itemCount = groups.size,
                     onSwap = { from, to -> viewModel.swapProxyGroupsInMemory(from, to) },
                     onDragFinished = { viewModel.persistCurrentOrder() }
                 ),
@@ -131,7 +130,11 @@ fun GroupsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "共 ${active.proxyGroups.size} 个策略组 · 长按拖动排序",
+                        text = if (active == null) {
+                            "尚未导入配置，点右下角「+」可直接新建策略组"
+                        } else {
+                            "共 ${groups.size} 个策略组 · 长按拖动排序"
+                        },
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.weight(1f)
                     )
@@ -150,7 +153,46 @@ fun GroupsScreen(
                 }
             }
 
-            itemsIndexed(active.proxyGroups, key = { _, it -> it.id }) { idx, group ->
+            if (groups.isEmpty()) {
+                item(key = "groups_empty_card") {
+                    Surface(
+                        color = PureWhite,
+                        border = BorderStroke(1.dp, BorderGray),
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("暂无策略组", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                text = "可以直接点击下方按钮新建自定义策略组，后续再添加节点或从配置池混入。",
+                                fontSize = 12.sp,
+                                color = SlateMuted
+                            )
+                            Button(
+                                onClick = {
+                                    isNewGroup = true
+                                    editingGroup = ProxyGroupEntry(
+                                        name = "🚀 ",
+                                        type = "select",
+                                        proxies = emptyList(),
+                                        rawYaml = ""
+                                    )
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent)
+                            ) {
+                                Icon(Icons.Outlined.Add, null, Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("新建策略组", fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            itemsIndexed(groups, key = { _, it -> it.id }) { idx, group ->
                 val isDragging = groupReorderState.draggedDataIndex == idx
                 GroupCard(
                     group = group,
@@ -204,8 +246,8 @@ fun GroupsScreen(
     }
 
     editingGroup?.let { group ->
-        val otherGroupNames = active.proxyGroups.filter { it.id != group.id }.map { it.name }
-        val allNodeNames = active.proxies.map { it.name }
+        val otherGroupNames = groups.filter { it.id != group.id }.map { it.name }
+        val allNodeNames = proxies.map { it.name }
         GroupEditDialog(
             initial = group,
             isNew = isNewGroup,

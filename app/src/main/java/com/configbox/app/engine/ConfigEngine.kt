@@ -42,21 +42,96 @@ object ConfigEngine {
     private val BUILTIN_POLICIES = setOf("DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE")
     private val PROBE_GROUP_TYPES = setOf("url-test", "fallback", "load-balance")
 
+    /**
+     * Creates a clean blank [SplitProfile] with zero nodes so users can freely add nodes,
+     * proxy groups, rules, or node subscriptions without first importing a config file.
+     */
+    fun createBlankProfile(
+        profileName: String = "自建配置",
+        withStarterTemplate: Boolean = true
+    ): SplitProfile {
+        val groups = if (withStarterTemplate) {
+            listOf(
+                buildProxyGroup(
+                    name = "🚀 节点选择",
+                    type = "select",
+                    proxies = listOf("DIRECT")
+                )
+            )
+        } else {
+            emptyList()
+        }
+        val rules = if (withStarterTemplate) {
+            listOf(
+                RuleEntry(type = "GEOIP", payload = "LAN", target = "DIRECT", noResolve = true),
+                RuleEntry(type = "GEOIP", payload = "CN", target = "DIRECT"),
+                RuleEntry(type = "MATCH", payload = "", target = "🚀 节点选择")
+            )
+        } else {
+            emptyList()
+        }
+        val now = System.currentTimeMillis()
+        val meta = ProfileMeta(
+            name = profileName.trim().ifBlank { "自建配置" },
+            subscriptionUrl = "",
+            createdAt = now,
+            updatedAt = now,
+            nodeCount = 0,
+            groupCount = groups.size,
+            ruleCount = rules.size,
+            relayBoundCount = 0,
+            subscriptionCount = 0
+        )
+        return SplitProfile(
+            meta = meta,
+            baseConfigYaml = defaultBaseYaml(),
+            proxies = emptyList(),
+            proxyGroups = groups,
+            rules = rules,
+            ruleProvidersYaml = "",
+            nodeSubscriptions = emptyList()
+        )
+    }
+
     fun splitConfig(
         rawYaml: String,
         profileName: String,
         subscriptionUrl: String = ""
     ): SplitProfile {
         val cleaned = rawYaml.removePrefix("\uFEFF").trim()
+        if (cleaned.isBlank()) {
+            return createBlankProfile(profileName.ifBlank { "空白配置" }, withStarterTemplate = false)
+        }
+
         val parsedMap = runCatching { YamlCodec.parseMap(cleaned) }.getOrNull()
 
-        // If the imported text is a Clash/Mihomo YAML map, split it losslessly.
-        if (parsedMap != null && (parsedMap.containsKey("proxies") || parsedMap.containsKey("proxy-groups") || parsedMap.containsKey("rules") || !ProxyUriParser.looksLikeUriList(cleaned))) {
+        // Detect a standalone single-node YAML map (has `type` & `server`, no top-level Clash sections)
+        val looksLikeSingleProxyMap = parsedMap != null &&
+            !parsedMap.containsKey("proxies") &&
+            !parsedMap.containsKey("proxy-groups") &&
+            !parsedMap.containsKey("rules") &&
+            !parsedMap.containsKey("rule-providers") &&
+            parsedMap.containsKey("type") &&
+            parsedMap.containsKey("server")
+
+        // If the imported text is a Clash/Mihomo YAML map (even with 0 proxies / pure rules / pure groups), split it losslessly.
+        if (parsedMap != null && !looksLikeSingleProxyMap &&
+            (parsedMap.containsKey("proxies") ||
+                parsedMap.containsKey("proxy-groups") ||
+                parsedMap.containsKey("rules") ||
+                parsedMap.containsKey("rule-providers") ||
+                !ProxyUriParser.looksLikeUriList(cleaned))
+        ) {
             return splitClashMap(parsedMap, profileName, subscriptionUrl)
         }
 
-        // Fallback: allow importing a Base64 or plaintext proxy-URI subscription directly as a profile.
-        val parsed = parseSubscriptionNodes(cleaned, subscriptionId = null, namePrefix = "")
+        // Fallback: allow importing Base64 / plaintext URI subscription OR bare YAML node list / single node YAML.
+        val parsed = runCatching {
+            parseSubscriptionNodes(cleaned, subscriptionId = null, namePrefix = "")
+        }.getOrElse {
+            val yamlListNodes = parseNodesFromYaml(cleaned, source = NodeSource.CUSTOM, subscriptionId = null)
+            SubscriptionParseResult(nodes = deduplicateNodes(yamlListNodes), skippedCount = 0)
+        }
         val proxies = deduplicateNodes(parsed.nodes)
         val nodeNames = proxies.map { it.name }
         val autoGroup = buildProxyGroup(
@@ -211,6 +286,24 @@ object ConfigEngine {
                     val tagged = applyPrefixAndSubTag(parsed, subscriptionId, namePrefix)
                     return SubscriptionParseResult(nodes = deduplicateNodes(tagged), skippedCount = skipped)
                 }
+            }
+        }
+
+        // 4. Try lenient YAML node list / single node YAML (handles bare `- name:` lists & misaligned snippets)
+        val lenientRaw = runCatching {
+            parseNodesFromYaml(cleaned, source = NodeSource.SUBSCRIPTION, subscriptionId = subscriptionId)
+        }.getOrNull()
+        if (!lenientRaw.isNullOrEmpty()) {
+            val prefixed = applyPrefixAndSubTag(lenientRaw, subscriptionId, namePrefix)
+            return SubscriptionParseResult(nodes = deduplicateNodes(prefixed), skippedCount = 0)
+        }
+        if (!decoded.isNullOrBlank()) {
+            val lenientDecoded = runCatching {
+                parseNodesFromYaml(decoded, source = NodeSource.SUBSCRIPTION, subscriptionId = subscriptionId)
+            }.getOrNull()
+            if (!lenientDecoded.isNullOrEmpty()) {
+                val prefixed = applyPrefixAndSubTag(lenientDecoded, subscriptionId, namePrefix)
+                return SubscriptionParseResult(nodes = deduplicateNodes(prefixed), skippedCount = 0)
             }
         }
 

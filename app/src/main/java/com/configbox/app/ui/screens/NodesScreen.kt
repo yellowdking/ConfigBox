@@ -104,10 +104,11 @@ fun NodesScreen(
     viewModel: ConfigBoxViewModel
 ) {
     val active = uiState.activeProfile
-    if (active == null) {
-        EmptyProfileNotice("请先在「配置」页导入或选择一个配置文件")
-        return
-    }
+    val activeId = active?.meta?.id
+    val activeName = active?.meta?.name ?: "自建配置"
+    val proxies = active?.proxies.orEmpty()
+    val nodeSubscriptions = active?.nodeSubscriptions.orEmpty()
+    val proxyGroups = active?.proxyGroups.orEmpty()
 
     var subTab by remember { mutableIntStateOf(0) } // 0 = 当前节点, 1 = 全局节点池, 2 = 节点订阅, 3 = 中转绑定
     var searchQuery by remember { mutableStateOf("") }
@@ -122,34 +123,34 @@ fun NodesScreen(
     var editingSub by remember { mutableStateOf<NodeSubscription?>(null) }
     var deletingSub by remember { mutableStateOf<NodeSubscription?>(null) }
 
-    val otherProfiles = remember(uiState.profiles, active.meta.id) {
-        uiState.profiles.filter { it.id != active.meta.id }
+    val otherProfiles = remember(uiState.profiles, activeId) {
+        uiState.profiles.filter { it.id != activeId }
     }
-    val domainNodeCount = remember(active.proxies) {
-        active.proxies.count { !NodeNetworkTools.isIpAddress(it.server) }
-    }
-
-    val subNameById = remember(active.nodeSubscriptions) {
-        active.nodeSubscriptions.associate { it.id to it.name }
-    }
-    val subIdByFilterLabel = remember(active.nodeSubscriptions) {
-        active.nodeSubscriptions.associate { "订阅:${it.name}" to it.id }
+    val domainNodeCount = remember(proxies) {
+        proxies.count { !NodeNetworkTools.isIpAddress(it.server) }
     }
 
-    val protocolFilters = remember(active.proxies, active.nodeSubscriptions) {
+    val subNameById = remember(nodeSubscriptions) {
+        nodeSubscriptions.associate { it.id to it.name }
+    }
+    val subIdByFilterLabel = remember(nodeSubscriptions) {
+        nodeSubscriptions.associate { "订阅:${it.name}" to it.id }
+    }
+
+    val protocolFilters = remember(proxies, nodeSubscriptions) {
         buildList {
             add("全部")
             add("已中转")
             add("自定义")
-            active.nodeSubscriptions.forEach { add("订阅:${it.name}") }
-            addAll(active.proxies.map { it.type.uppercase() }.distinct().sorted())
+            nodeSubscriptions.forEach { add("订阅:${it.name}") }
+            addAll(proxies.map { it.type.uppercase() }.distinct().sorted())
         }
     }
 
     val effectiveFilter = if (selectedFilter in protocolFilters) selectedFilter else "全部"
 
-    val filteredNodes = remember(active.proxies, searchQuery, effectiveFilter, subIdByFilterLabel) {
-        active.proxies.filter { node ->
+    val filteredNodes = remember(proxies, searchQuery, effectiveFilter, subIdByFilterLabel) {
+        proxies.filter { node ->
             val matchFilter = when {
                 effectiveFilter == "全部" -> true
                 effectiveFilter == "已中转" -> !node.dialerProxy.isNullOrBlank()
@@ -164,16 +165,16 @@ fun NodesScreen(
         }
     }
 
-    val relayedNodes = remember(active.proxies) {
-        active.proxies.filter { !it.dialerProxy.isNullOrBlank() }
+    val relayedNodes = remember(proxies) {
+        proxies.filter { !it.dialerProxy.isNullOrBlank() }
     }
 
-    val groupNames = remember(active.proxyGroups) {
-        active.proxyGroups.map { it.name }
+    val groupNames = remember(proxyGroups) {
+        proxyGroups.map { it.name }
     }
 
-    val entryCandidates = remember(active.proxyGroups, active.proxies) {
-        active.proxyGroups.map { it.name } + active.proxies.map { it.name }
+    val entryCandidates = remember(proxyGroups, proxies) {
+        proxyGroups.map { it.name } + proxies.map { it.name }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -189,7 +190,7 @@ fun NodesScreen(
                 Tab(
                     selected = subTab == 0,
                     onClick = { subTab = 0 },
-                    text = { Text("当前(${active.proxies.size})", fontSize = 11.sp, maxLines = 1) }
+                    text = { Text("当前(${proxies.size})", fontSize = 11.sp, maxLines = 1) }
                 )
                 Tab(
                     selected = subTab == 1,
@@ -199,7 +200,7 @@ fun NodesScreen(
                 Tab(
                     selected = subTab == 2,
                     onClick = { subTab = 2 },
-                    text = { Text("订阅(${active.nodeSubscriptions.size})", fontSize = 11.sp, maxLines = 1) }
+                    text = { Text("订阅(${nodeSubscriptions.size})", fontSize = 11.sp, maxLines = 1) }
                 )
                 Tab(
                     selected = subTab == 3,
@@ -302,9 +303,57 @@ fun NodesScreen(
                     ) {
                         item(key = "nodes_hint") {
                             Text(
-                                text = if (canDragReorder) "长按任意节点卡片可上下拖动排序 · 点击编辑 · 点延迟标签测速" else "清除搜索和筛选后可长按拖动排序",
+                                text = when {
+                                    active == null -> "尚未导入配置，可直接添加节点（URI / YAML / 订阅），系统将自动创建「自建配置」并入池"
+                                    proxies.isEmpty() -> "当前配置「$activeName」暂无节点，可随时手动添加或从全局节点池挑选"
+                                    canDragReorder -> "长按任意节点卡片可上下拖动排序 · 点击编辑 · 点延迟标签测速"
+                                    else -> "清除搜索和筛选后可长按拖动排序"
+                                },
                                 style = MaterialTheme.typography.labelMedium
                             )
+                        }
+                        if (proxies.isEmpty()) {
+                            item(key = "nodes_empty_card") {
+                                Surface(
+                                    color = PureWhite,
+                                    border = BorderStroke(1.dp, BorderGray),
+                                    shape = MaterialTheme.shapes.medium,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(18.dp),
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Text(
+                                            text = if (active == null) "直接添加你的第一个节点" else "当前配置暂无节点",
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        Text(
+                                            text = "支持粘贴单/多条 URI 链接、单/多节点 YAML（不对齐也能自动识别）或直接拉取外部节点订阅。",
+                                            fontSize = 12.sp,
+                                            color = SlateMuted
+                                        )
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Button(
+                                                onClick = { showAddNodeDialog = true },
+                                                colors = ButtonDefaults.buttonColors(containerColor = SkyAccent)
+                                            ) {
+                                                Icon(Icons.Outlined.Add, null, Modifier.size(16.dp))
+                                                Spacer(Modifier.width(4.dp))
+                                                Text("添加节点", fontSize = 12.sp)
+                                            }
+                                            if (uiState.globalNodePool.isNotEmpty()) {
+                                                OutlinedButton(
+                                                    onClick = { subTab = 1 },
+                                                    border = BorderStroke(1.dp, EmeraldActive)
+                                                ) {
+                                                    Text("从节点池挑 (${uiState.globalNodePool.size})", fontSize = 12.sp, color = EmeraldActive)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         itemsIndexed(filteredNodes, key = { _, node -> node.id }) { idx, node ->
                             val isDragging = nodeReorderState.draggedDataIndex == idx
@@ -328,7 +377,7 @@ fun NodesScreen(
 
                 1 -> {
                     GlobalNodePoolPane(
-                        activeProfileName = active.meta.name,
+                        activeProfileName = activeName,
                         pool = uiState.globalNodePool,
                         poolLatencies = uiState.poolLatencies,
                         isTestingPool = uiState.isTestingPoolLatencies,
@@ -343,7 +392,7 @@ fun NodesScreen(
 
                 2 -> {
                     NodeSubscriptionsPane(
-                        subscriptions = active.nodeSubscriptions,
+                        subscriptions = nodeSubscriptions,
                         isLoading = uiState.isLoading,
                         onRefreshAll = { viewModel.refreshAllNodeSubscriptions() },
                         onRefreshOne = { viewModel.refreshNodeSubscription(it.id) },
@@ -559,7 +608,7 @@ fun NodesScreen(
     if (showRelayBindDialog) {
         BindRelayDialog(
             entryCandidates = entryCandidates,
-            nodes = active.proxies,
+            nodes = proxies,
             onDismiss = { showRelayBindDialog = false },
             onBind = { entry, exitIds ->
                 showRelayBindDialog = false

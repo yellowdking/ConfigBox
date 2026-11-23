@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentPaste
@@ -41,6 +42,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -77,6 +79,7 @@ fun ProfilesScreen(
     var showUrlDialog by remember { mutableStateOf(false) }
     var showPasteDialog by remember { mutableStateOf(false) }
     var showComposeDialog by remember { mutableStateOf(false) }
+    var showBlankDialog by remember { mutableStateOf(false) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -114,6 +117,7 @@ fun ProfilesScreen(
                     onPickFile = { filePickerLauncher.launch(arrayOf("*/*")) },
                     onImportUrl = { showUrlDialog = true },
                     onPasteYaml = { showPasteDialog = true },
+                    onCreateBlank = { showBlankDialog = true },
                     onImportDemo = { viewModel.importDemoProfile() },
                     onComposeNew = { showComposeDialog = true }
                 )
@@ -132,12 +136,12 @@ fun ProfilesScreen(
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text(
-                                text = "尚未导入 Clash 配置文件",
+                                text = "尚未创建或导入配置",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                text = "导入后自动拆分为「配置池」与「全局节点池」，可在任意基底上自由混入其他配置的策略组、规则并挑选节点。",
+                                text = "可直接点上方「空白配置」从零搭建，或直接前往「节点 / 策略组 / 规则」页添加内容，系统会自动创建配置；也支持导入无节点的纯规则配置。",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = SlateMuted
                             )
@@ -190,6 +194,16 @@ fun ProfilesScreen(
         )
     }
 
+    if (showBlankDialog) {
+        CreateBlankProfileDialog(
+            onDismiss = { showBlankDialog = false },
+            onConfirm = { name, withStarter ->
+                showBlankDialog = false
+                viewModel.createBlankProfile(name, withStarter)
+            }
+        )
+    }
+
     if (showUrlDialog) {
         ImportUrlDialog(
             onDismiss = { showUrlDialog = false },
@@ -219,6 +233,7 @@ private fun ImportActionsCard(
     onPickFile: () -> Unit,
     onImportUrl: () -> Unit,
     onPasteYaml: () -> Unit,
+    onCreateBlank: () -> Unit,
     onImportDemo: () -> Unit,
     onComposeNew: () -> Unit
 ) {
@@ -229,12 +244,12 @@ private fun ImportActionsCard(
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "导入配置入池 · 自由撮合定制",
+                text = "配置池 · 空白新建 · 自由撮合",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "每个导入的配置都会自动拆分为「配置池」与「全局节点池」；选定基底后可混入任意配置的策略组/规则并自由挑节点。",
+                text = "支持导入完整配置或无节点纯规则配置，也可直接新建空白配置从零添加节点、策略组与规则。",
                 fontSize = 12.sp,
                 color = SlateMuted
             )
@@ -277,35 +292,47 @@ private fun ImportActionsCard(
                     Text("粘贴文本", fontSize = 13.sp, color = SlateInk)
                 }
                 OutlinedButton(
-                    onClick = onImportDemo,
+                    onClick = onCreateBlank,
                     modifier = Modifier.weight(1f),
-                    border = BorderStroke(1.dp, BorderGray)
+                    border = BorderStroke(1.dp, EmeraldActive)
                 ) {
-                    Icon(Icons.Outlined.Science, null, Modifier.size(16.dp))
+                    Icon(Icons.Outlined.Add, null, Modifier.size(16.dp), tint = EmeraldActive)
                     Spacer(Modifier.width(6.dp))
-                    Text("示例配置", fontSize = 13.sp, color = SlateInk)
+                    Text("空白配置", fontSize = 13.sp, color = EmeraldActive)
                 }
             }
             Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = onComposeNew,
-                enabled = canCompose,
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = EmeraldActive,
-                    contentColor = PureWhite
-                )
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(Icons.Outlined.AutoAwesome, null, Modifier.size(17.dp))
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text = if (canCompose) {
-                        "撮合新建配置（配置池 $profileCount · 节点池 $poolNodeCount）"
-                    } else {
-                        "撮合新建配置（请先导入至少 1 份配置）"
-                    },
-                    fontSize = 13.sp
-                )
+                Button(
+                    onClick = onComposeNew,
+                    enabled = canCompose,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = EmeraldActive,
+                        contentColor = PureWhite
+                    )
+                ) {
+                    Icon(Icons.Outlined.AutoAwesome, null, Modifier.size(17.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (canCompose) "撮合新建（池 $profileCount · 节点 $poolNodeCount）" else "撮合新建配置",
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                OutlinedButton(
+                    onClick = onImportDemo,
+                    border = BorderStroke(1.dp, BorderGray),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Outlined.Science, null, Modifier.size(16.dp), tint = SlateMuted)
+                    Spacer(Modifier.width(4.dp))
+                    Text("示例", fontSize = 12.sp, color = SlateInk)
+                }
             }
         }
     }
@@ -512,7 +539,14 @@ private fun ImportPasteDialog(
                 OutlinedTextField(
                     value = yaml,
                     onValueChange = { yaml = it },
-                    label = { Text("YAML / Base64 / 节点 URI 内容") },
+                    label = { Text("YAML / 纯规则配置 / 单或多节点 / URI") },
+                    placeholder = {
+                        Text(
+                            text = "可粘贴完整 Clash 配置、不含节点的纯规则/策略组模板，或直接粘贴节点列表",
+                            fontSize = 11.sp,
+                            color = SlateMuted.copy(alpha = 0.7f)
+                        )
+                    },
                     minLines = 6,
                     maxLines = 12,
                     modifier = Modifier.fillMaxWidth()
@@ -525,6 +559,54 @@ private fun ImportPasteDialog(
                 enabled = yaml.isNotBlank()
             ) {
                 Text("导入并拆分")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun CreateBlankProfileDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (name: String, withStarterTemplate: Boolean) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var withStarter by remember { mutableStateOf(true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("新建空白配置") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("配置名称") },
+                    placeholder = { Text("例如：我的自建配置 / 纯规则模板") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("预置默认策略组与基础规则", fontSize = 13.sp, color = SlateInk)
+                        Text("关闭则生成纯空白配置，完全自由定制", fontSize = 11.sp, color = SlateMuted)
+                    }
+                    Switch(checked = withStarter, onCheckedChange = { withStarter = it })
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldActive),
+                onClick = { onConfirm(name.trim().ifBlank { "自建配置" }, withStarter) }
+            ) {
+                Text("创建")
             }
         },
         dismissButton = {

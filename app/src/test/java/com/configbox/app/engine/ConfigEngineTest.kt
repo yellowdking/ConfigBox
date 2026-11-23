@@ -562,4 +562,47 @@ class ConfigEngineTest {
         assertEquals("b.example.com", multiNodes[1].server)
         assertEquals(8388, multiNodes[1].port)
     }
+
+    @Test
+    fun blankProfileAndZeroNodeRuleOnlyConfigWorkWithoutNodes() {
+        // 1. Blank profile creation & compilation with 0 nodes
+        val blank = ConfigEngine.createBlankProfile("自建配置", withStarterTemplate = true)
+        assertEquals("自建配置", blank.meta.name)
+        assertTrue(blank.proxies.isEmpty())
+        assertEquals(1, blank.proxyGroups.size)
+        assertEquals(3, blank.rules.size)
+        val blankCompiled = YamlCodec.parseMap(ConfigEngine.compileConfig(blank))
+        @Suppress("UNCHECKED_CAST")
+        val blankProxies = blankCompiled["proxies"] as List<*>
+        assertTrue(blankProxies.isEmpty())
+
+        // 2. Pure rule/group config with NO `proxies:` section at all
+        val ruleOnlyYaml = """
+            mixed-port: 7890
+            proxy-groups:
+              - name: "🤖 AI"
+                type: select
+                proxies:
+                  - DIRECT
+            rules:
+              - DOMAIN-SUFFIX,openai.com,🤖 AI
+              - MATCH,DIRECT
+        """.trimIndent()
+        val splitRuleOnly = ConfigEngine.splitConfig(ruleOnlyYaml, "纯规则模板")
+        assertTrue(splitRuleOnly.proxies.isEmpty())
+        assertEquals(1, splitRuleOnly.proxyGroups.size)
+        assertEquals(2, splitRuleOnly.rules.size)
+
+        // 3. Standalone single-node YAML imported directly via splitConfig
+        val singleNodeYaml = """
+            name: 独立节点
+            type: socks5
+            server: 198.51.100.55
+            port: 1080
+        """.trimIndent()
+        val splitSingleNode = ConfigEngine.splitConfig(singleNodeYaml, "单节点配置")
+        assertEquals(1, splitSingleNode.proxies.size)
+        assertEquals("独立节点", splitSingleNode.proxies.first().name)
+        assertEquals("198.51.100.55", splitSingleNode.proxies.first().server)
+    }
 }

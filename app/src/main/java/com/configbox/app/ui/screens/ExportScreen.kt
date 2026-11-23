@@ -61,7 +61,41 @@ fun ExportScreen(
 ) {
     val active = uiState.activeProfile
     if (active == null) {
-        EmptyProfileNotice("请先在「配置」页导入或选择一个 Clash 配置文件")
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Surface(
+                color = PureWhite,
+                border = BorderStroke(1.dp, BorderGray),
+                shape = MaterialTheme.shapes.medium
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "当前还没有可导出的配置",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "可立即新建一份空白配置，或在「节点 / 策略组 / 规则」页直接添加内容。",
+                        fontSize = 12.sp,
+                        color = SlateMuted
+                    )
+                    Button(
+                        onClick = { viewModel.createBlankProfile("自建配置", withStarterTemplate = true) },
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldActive)
+                    ) {
+                        Text("一键新建空白配置")
+                    }
+                }
+            }
+        }
         return
     }
 
