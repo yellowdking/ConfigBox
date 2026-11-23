@@ -1,7 +1,9 @@
 package com.configbox.app.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,7 +19,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -25,7 +26,6 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.DragIndicator
 import androidx.compose.material.icons.outlined.MergeType
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -40,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -50,6 +51,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -58,9 +60,6 @@ import androidx.compose.ui.unit.sp
 import com.configbox.app.model.ProxyGroupEntry
 import com.configbox.app.ui.ConfigBoxUiState
 import com.configbox.app.ui.ConfigBoxViewModel
-import com.configbox.app.ui.components.draggedItemVisual
-import com.configbox.app.ui.components.longPressReorderContainer
-import com.configbox.app.ui.components.rememberDragReorderState
 import com.configbox.app.ui.theme.BorderGray
 import com.configbox.app.ui.theme.EmeraldActive
 import com.configbox.app.ui.theme.PureWhite
@@ -95,6 +94,7 @@ fun GroupsScreen(
 
     var editingGroup by remember { mutableStateOf<ProxyGroupEntry?>(null) }
     var isNewGroup by remember { mutableStateOf(false) }
+    var deletingGroup by remember { mutableStateOf<ProxyGroupEntry?>(null) }
     var showMixinDialog by remember { mutableStateOf(false) }
 
     val donorProfiles = remember(uiState.allProfiles, activeId) {
@@ -105,21 +105,11 @@ fun GroupsScreen(
         proxies.filter { !it.dialerProxy.isNullOrBlank() }.map { it.name }.toSet()
     }
 
-    val groupListState = rememberLazyListState()
-    val groupReorderState = rememberDragReorderState(listState = groupListState, headerCount = 1)
+    val enabledCount = remember(groups) { groups.count { it.enabled } }
 
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
-            state = groupListState,
-            modifier = Modifier
-                .fillMaxSize()
-                .longPressReorderContainer(
-                    reorderState = groupReorderState,
-                    enabled = groups.isNotEmpty(),
-                    itemCount = groups.size,
-                    onSwap = { from, to -> viewModel.swapProxyGroupsInMemory(from, to) },
-                    onDragFinished = { viewModel.persistCurrentOrder() }
-                ),
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 84.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
@@ -133,7 +123,7 @@ fun GroupsScreen(
                         text = if (active == null) {
                             "尚未导入配置，点右下角「+」可直接新建策略组"
                         } else {
-                            "共 ${groups.size} 个策略组 · 长按拖动排序"
+                            "共 ${groups.size} 个策略组（启用 $enabledCount 个）· 点击编辑 · 长按删除"
                         },
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.weight(1f)
@@ -193,16 +183,18 @@ fun GroupsScreen(
             }
 
             itemsIndexed(groups, key = { _, it -> it.id }) { idx, group ->
-                val isDragging = groupReorderState.draggedDataIndex == idx
                 GroupCard(
                     group = group,
-                    isDragging = isDragging,
-                    modifier = Modifier.draggedItemVisual(isDragging, groupReorderState.dragOffsetY),
+                    canMoveUp = idx > 0,
+                    canMoveDown = idx < groups.lastIndex,
                     onClick = {
                         isNewGroup = false
                         editingGroup = group
                     },
-                    onDelete = { viewModel.deleteProxyGroup(group.id) }
+                    onLongClick = { deletingGroup = group },
+                    onToggleEnabled = { viewModel.toggleProxyGroup(group.id) },
+                    onMoveUp = { viewModel.moveProxyGroup(group.id, -1) },
+                    onMoveDown = { viewModel.moveProxyGroup(group.id, 1) }
                 )
             }
         }
@@ -245,6 +237,49 @@ fun GroupsScreen(
         )
     }
 
+    deletingGroup?.let { group ->
+        AlertDialog(
+            onDismissRequest = { deletingGroup = null },
+            containerColor = PureWhite,
+            title = { Text("删除策略组") },
+            text = {
+                Text(
+                    text = "确定要永久删除策略组「${group.name}」吗？\n\n如果只是暂时不用，建议直接关闭启用开关（不会写入配置文件，随时可重新启用）。",
+                    fontSize = 13.sp,
+                    color = SlateInk
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = RoseDanger),
+                    onClick = {
+                        deletingGroup = null
+                        viewModel.deleteProxyGroup(group.id)
+                    }
+                ) {
+                    Text("确认删除")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (group.enabled) {
+                        TextButton(
+                            onClick = {
+                                deletingGroup = null
+                                viewModel.toggleProxyGroup(group.id)
+                            }
+                        ) {
+                            Text("改为停用", color = SkyAccent)
+                        }
+                    }
+                    TextButton(onClick = { deletingGroup = null }) {
+                        Text("取消")
+                    }
+                }
+            }
+        )
+    }
+
     editingGroup?.let { group ->
         val otherGroupNames = groups.filter { it.id != group.id }.map { it.name }
         val allNodeNames = proxies.map { it.name }
@@ -270,76 +305,131 @@ fun GroupsScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GroupCard(
     group: ProxyGroupEntry,
-    isDragging: Boolean,
-    modifier: Modifier = Modifier,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
     onClick: () -> Unit,
-    onDelete: () -> Unit
+    onLongClick: () -> Unit,
+    onToggleEnabled: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit
 ) {
     Card(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
+            .alpha(if (group.enabled) 1f else 0.55f)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         colors = CardDefaults.cardColors(containerColor = PureWhite),
-        border = BorderStroke(if (isDragging) 1.5.dp else 1.dp, if (isDragging) SkyAccent else BorderGray),
+        border = BorderStroke(1.dp, BorderGray),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 12.dp, vertical = 10.dp)
         ) {
-            Icon(
-                imageVector = Icons.Outlined.DragIndicator,
-                contentDescription = "长按拖动",
-                tint = SlateMuted,
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(Modifier.width(8.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = group.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f, fill = false),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Surface(
+                            color = SkyAccent.copy(alpha = 0.1f),
+                            shape = MaterialTheme.shapes.extraSmall
+                        ) {
+                            Text(
+                                text = group.type,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = SkyAccent
+                            )
+                        }
+                        if (!group.enabled) {
+                            Spacer(Modifier.width(6.dp))
+                            Surface(
+                                color = SlateMuted.copy(alpha = 0.14f),
+                                shape = MaterialTheme.shapes.extraSmall
+                            ) {
+                                Text(
+                                    text = "未启用",
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = SlateMuted
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
                     Text(
-                        text = group.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.weight(1f),
-                        maxLines = 1,
+                        text = "${group.proxies.size} 项 · " +
+                            group.proxies.take(6).joinToString(" · ") +
+                            if (group.proxies.size > 6) " …" else "",
+                        fontSize = 12.sp,
+                        color = SlateMuted,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Surface(
-                        color = SkyAccent.copy(alpha = 0.1f),
-                        shape = MaterialTheme.shapes.extraSmall
-                    ) {
-                        Text(
-                            text = group.type,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = SkyAccent
-                        )
-                    }
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = "${group.proxies.size} 项",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        color = SlateMuted
-                    )
                 }
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = group.proxies.take(6).joinToString(" · ") + if (group.proxies.size > 6) " …" else "",
-                    fontSize = 12.sp,
-                    color = SlateMuted,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
+                Spacer(Modifier.width(8.dp))
+                Switch(
+                    checked = group.enabled,
+                    onCheckedChange = { onToggleEnabled() }
                 )
             }
-            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除策略组", tint = RoseDanger, modifier = Modifier.size(18.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = if (group.enabled) "将写入最终配置 · 长按删除" else "暂不写入最终配置 · 长按删除",
+                    fontSize = 10.sp,
+                    color = SlateMuted
+                )
+                Row {
+                    IconButton(
+                        onClick = onMoveUp,
+                        enabled = canMoveUp,
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.ArrowUpward,
+                            contentDescription = "上移",
+                            tint = if (canMoveUp) SlateMuted else BorderGray,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onMoveDown,
+                        enabled = canMoveDown,
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.ArrowDownward,
+                            contentDescription = "下移",
+                            tint = if (canMoveDown) SlateMuted else BorderGray,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
             }
         }
     }

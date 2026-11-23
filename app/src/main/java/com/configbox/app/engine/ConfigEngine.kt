@@ -475,7 +475,8 @@ object ConfigEngine {
                     proxies = members,
                     url = group.url,
                     interval = group.interval,
-                    existingRawYaml = group.rawYaml
+                    existingRawYaml = group.rawYaml,
+                    enabled = group.enabled
                 )
             } else {
                 group
@@ -567,7 +568,8 @@ object ConfigEngine {
                         proxies = group.proxies.filterNot { it in removedNames },
                         url = group.url,
                         interval = group.interval,
-                        existingRawYaml = group.rawYaml
+                        existingRawYaml = group.rawYaml,
+                        enabled = group.enabled
                     )
                 } else {
                     group
@@ -599,6 +601,10 @@ object ConfigEngine {
         val baseMap = YamlCodec.parseMap(profile.baseConfigYaml)
         output.putAll(baseMap)
 
+        val enabledGroups = profile.proxyGroups.filter { it.enabled }
+        val enabledGroupNames = enabledGroups.map { it.name }.toSet()
+        val disabledGroupNames = profile.proxyGroups.filterNot { it.enabled }.map { it.name }.toSet()
+
         val compiledProxies = mutableListOf<LinkedHashMap<String, Any?>>()
         val validNodeNames = BUILTIN_POLICIES.toMutableSet()
 
@@ -610,7 +616,9 @@ object ConfigEngine {
             map["server"] = node.server
             map["port"] = node.port
             map["udp"] = node.udp
-            val dialer = node.dialerProxy?.trim()?.takeIf { it.isNotBlank() && it != node.name }
+            val dialer = node.dialerProxy?.trim()?.takeIf {
+                it.isNotBlank() && it != node.name && it !in disabledGroupNames
+            }
             if (dialer != null) {
                 map["dialer-proxy"] = dialer
             } else {
@@ -621,16 +629,15 @@ object ConfigEngine {
         }
         output["proxies"] = compiledProxies
 
-        val allGroupNames = profile.proxyGroups.map { it.name }.toSet()
         val compiledGroups = mutableListOf<LinkedHashMap<String, Any?>>()
-        for (group in profile.proxyGroups) {
+        for (group in enabledGroups) {
             val map = YamlCodec.parseMap(group.rawYaml)
             map["name"] = group.name
             map["type"] = group.type
 
             val hasDynamicProviders = hasDynamicGroupMembers(map)
             val filteredMembers = group.proxies
-                .filter { it in validNodeNames || (it in allGroupNames && it != group.name) }
+                .filter { it in validNodeNames || (it in enabledGroupNames && it != group.name) }
                 .distinct()
 
             if (filteredMembers.isNotEmpty()) {
@@ -659,9 +666,20 @@ object ConfigEngine {
             }
         }
 
+        val fallbackTarget = enabledGroups.firstOrNull()?.name ?: "DIRECT"
         output["rules"] = profile.rules
             .filter { it.enabled }
-            .map { it.toClashRuleString() }
+            .mapNotNull { rule ->
+                if (rule.target in disabledGroupNames) {
+                    if (rule.type.equals("MATCH", ignoreCase = true)) {
+                        rule.copy(target = fallbackTarget).toClashRuleString()
+                    } else {
+                        null
+                    }
+                } else {
+                    rule.toClashRuleString()
+                }
+            }
 
         return YamlCodec.dump(output)
     }
@@ -678,7 +696,8 @@ object ConfigEngine {
         proxies: List<String>,
         url: String? = null,
         interval: Int? = null,
-        existingRawYaml: String? = null
+        existingRawYaml: String? = null,
+        enabled: Boolean = true
     ): ProxyGroupEntry {
         val cleanName = name.trim()
         val cleanType = type.trim().ifBlank { "select" }
@@ -733,7 +752,8 @@ object ConfigEngine {
             proxies = cleanProxies,
             url = effectiveUrl,
             interval = effectiveInterval,
-            rawYaml = YamlCodec.dump(map)
+            rawYaml = YamlCodec.dump(map),
+            enabled = enabled
         )
     }
 
@@ -1346,7 +1366,8 @@ object ConfigEngine {
                         proxies = group.proxies + uniqueNode.name,
                         url = group.url,
                         interval = group.interval,
-                        existingRawYaml = group.rawYaml
+                        existingRawYaml = group.rawYaml,
+                        enabled = group.enabled
                     )
                 } else {
                     group
@@ -1479,7 +1500,8 @@ object ConfigEngine {
                 proxies = members,
                 url = group.url,
                 interval = group.interval,
-                existingRawYaml = group.rawYaml
+                existingRawYaml = group.rawYaml,
+                enabled = group.enabled
             )
         }
 

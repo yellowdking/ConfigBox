@@ -605,4 +605,45 @@ class ConfigEngineTest {
         assertEquals("独立节点", splitSingleNode.proxies.first().name)
         assertEquals("198.51.100.55", splitSingleNode.proxies.first().server)
     }
+
+    @Test
+    fun disabledProxyGroupsAreOmittedFromCompiledYamlAndRestoredWhenReEnabled() {
+        val split = ConfigEngine.splitConfig(ConfigEngine.SAMPLE_CLASH_YAML, "策略组开关测试")
+        val targetGroupName = "🏠 家宽落地"
+
+        // Disable `🏠 家宽落地`
+        val disabledProfile = split.copy(
+            proxyGroups = split.proxyGroups.map { g ->
+                if (g.name == targetGroupName) g.copy(enabled = false) else g
+            }
+        )
+        val compiledDisabled = YamlCodec.parseMap(ConfigEngine.compileConfig(disabledProfile))
+
+        @Suppress("UNCHECKED_CAST")
+        val compiledGroups = compiledDisabled["proxy-groups"] as List<Map<String, Any?>>
+        val compiledGroupNames = compiledGroups.map { it["name"].toString() }
+        assertFalse(targetGroupName in compiledGroupNames)
+        // Other enabled groups must not retain broken references to disabled group
+        val selectMembers = compiledGroups.first { it["name"] == "🚀 节点选择" }["proxies"] as List<*>
+        assertFalse(targetGroupName in selectMembers)
+
+        // Rules targeting the disabled group must be skipped so Clash/Mihomo won't fail to load
+        @Suppress("UNCHECKED_CAST")
+        val compiledRules = compiledDisabled["rules"] as List<String>
+        assertFalse(compiledRules.any { it.endsWith(",$targetGroupName") })
+
+        // Re-enabling the group restores it along with all references and rules losslessly!
+        val reEnabledProfile = disabledProfile.copy(
+            proxyGroups = disabledProfile.proxyGroups.map { g ->
+                if (g.name == targetGroupName) g.copy(enabled = true) else g
+            }
+        )
+        val compiledRestored = YamlCodec.parseMap(ConfigEngine.compileConfig(reEnabledProfile))
+        @Suppress("UNCHECKED_CAST")
+        val restoredGroupNames = (compiledRestored["proxy-groups"] as List<Map<String, Any?>>).map { it["name"].toString() }
+        assertTrue(targetGroupName in restoredGroupNames)
+        @Suppress("UNCHECKED_CAST")
+        val restoredRules = compiledRestored["rules"] as List<String>
+        assertTrue(restoredRules.any { it.endsWith(",$targetGroupName") })
+    }
 }

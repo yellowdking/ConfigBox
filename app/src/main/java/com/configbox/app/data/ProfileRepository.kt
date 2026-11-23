@@ -138,7 +138,11 @@ class ProfileRepository(context: Context) {
                 combined
             }
 
+            val disabledGroups = File(dir, "disabled_groups.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<List<String>>(it.readText()) }.getOrDefault(emptyList())
+            }?.toSet() ?: emptySet()
             val groups = readGroupListFile(File(dir, "groups.yaml"))
+                .map { group -> group.copy(enabled = group.name !in disabledGroups) }
             val rules = File(dir, "rules.json").takeIf { it.exists() }?.let {
                 runCatching { json.decodeFromString<List<RuleEntry>>(it.readText()) }.getOrDefault(emptyList())
             } ?: emptyList()
@@ -204,6 +208,8 @@ class ProfileRepository(context: Context) {
             writeTextAtomic(File(dir, "node_origins.json"), json.encodeToString(originMap))
 
             writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
+            val disabledGroupNames = updated.proxyGroups.filterNot { it.enabled }.map { it.name }
+            writeTextAtomic(File(dir, "disabled_groups.json"), json.encodeToString(disabledGroupNames))
             writeTextAtomic(File(dir, "rules.json"), json.encodeToString(updated.rules))
             writeTextAtomic(File(dir, "rule_providers.yaml"), updated.ruleProvidersYaml)
 

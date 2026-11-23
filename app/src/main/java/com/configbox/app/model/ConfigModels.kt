@@ -90,7 +90,8 @@ data class ProxyGroupEntry(
     val proxies: List<String>,
     val url: String? = null,
     val interval: Int? = null,
-    val rawYaml: String
+    val rawYaml: String,
+    val enabled: Boolean = true
 )
 
 /**

@@ -1257,7 +1257,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 proxies = proxies,
                 url = url,
                 interval = interval,
-                existingRawYaml = oldGroup?.rawYaml
+                existingRawYaml = oldGroup?.rawYaml,
+                enabled = oldGroup?.enabled ?: true
             )
         } else {
             ConfigEngine.buildProxyGroup(name = name, type = type, proxies = proxies, url = url, interval = interval)
@@ -1303,6 +1304,21 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             ),
             if (exists) "策略组已更新" else "已新建策略组：${built.name}"
         )
+    }
+
+    fun toggleProxyGroup(groupId: String) {
+        val profile = _uiState.value.activeProfile ?: return
+        val target = profile.proxyGroups.firstOrNull { it.id == groupId } ?: return
+        val nextEnabled = !target.enabled
+        val updatedGroups = profile.proxyGroups.map { group ->
+            if (group.id == groupId) group.copy(enabled = nextEnabled) else group
+        }
+        val msg = if (nextEnabled) {
+            "已启用策略组「${target.name}」（将写入配置）"
+        } else {
+            "已停用策略组「${target.name}」（暂不写入配置）"
+        }
+        mutateActiveProfile(profile.copy(proxyGroups = updatedGroups), msg)
     }
 
     fun moveProxyGroup(groupId: String, delta: Int) {
@@ -1425,7 +1441,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     proxies = pruned,
                     url = group.url,
                     interval = group.interval,
-                    existingRawYaml = group.rawYaml
+                    existingRawYaml = group.rawYaml,
+                    enabled = group.enabled
                 )
             } else {
                 group
@@ -1448,7 +1465,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     proxies = replaced,
                     url = group.url,
                     interval = group.interval,
-                    existingRawYaml = group.rawYaml
+                    existingRawYaml = group.rawYaml,
+                    enabled = group.enabled
                 )
             } else {
                 group
