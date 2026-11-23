@@ -1,5 +1,6 @@
 package com.configbox.app.engine
 
+import com.configbox.app.model.DonorSelection
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.RuleEntry
@@ -321,5 +322,180 @@ class ConfigEngineTest {
         assertEquals(target.proxies.size + 1, updatedTarget.proxies.size)
         val selectGroup = updatedTarget.proxyGroups.first { it.name == "🚀 节点选择" }
         assertTrue("香港 IPLC 01 (2)" in selectGroup.proxies)
+    }
+
+    @Test
+    fun composeCustomProfileMergesBaseDonorRuleSetProvidersAndPoolNodes() {
+        val baseProfile = ConfigEngine.splitConfig(ConfigEngine.SAMPLE_CLASH_YAML, "基底配置A")
+        val donorYaml = """
+            proxies:
+              - name: "日本东京 B1"
+                type: trojan
+                server: jp1.donor.example
+                port: 443
+                password: jp-secret-password
+                udp: true
+              - name: "新加坡 B2"
+                type: trojan
+                server: sg2.donor.example
+                port: 443
+                password: sg-secret-password
+                udp: true
+            proxy-groups:
+              - name: "🤖 AI 专用"
+                type: select
+                proxies:
+                  - "日本东京 B1"
+                  - DIRECT
+            rule-providers:
+              openai-set:
+                type: http
+                behavior: domain
+                url: https://example.com/openai.yaml
+                path: ./ruleset/openai.yaml
+                interval: 86400
+            rules:
+              - RULE-SET,openai-set,🤖 AI 专用
+              - DOMAIN-SUFFIX,claude.ai,🤖 AI 专用
+              - MATCH,DIRECT
+        """.trimIndent()
+        val donorProfile = ConfigEngine.splitConfig(donorYaml, "规则配置B")
+
+        val pool = ConfigEngine.buildGlobalNodePool(listOf(baseProfile, donorProfile))
+        // 4 from SAMPLE_CLASH_YAML + 2 from donorProfile = 6 unique nodes in global pool
+        assertEquals(6, pool.size)
+
+        val pickedPoolNodes = pool.filter { it.node.name in setOf("香港 IPLC 01", "日本东京 B1") }
+        val donorAiRules = donorProfile.rules
+            .filterNot { it.type.equals("MATCH", ignoreCase = true) }
+            .map { it.id }
+            .toSet()
+
+        val composed = ConfigEngine.composeCustomProfile(
+            profileName = "我的定制主力",
+            baseProfile = baseProfile,
+            includeBaseGroups = true,
+            includeBaseRules = true,
+            donors = listOf(
+                DonorSelection(
+                    donorProfile = donorProfile,
+                    selectedGroupNames = setOf("🤖 AI 专用"),
+                    selectedRuleIds = donorAiRules
+                )
+            ),
+            selectedPoolNodes = pickedPoolNodes,
+            autoPopulateGroups = setOf("🚀 节点选择", "🤖 AI 专用")
+        )
+
+        assertTrue(composed.meta.isComposed)
+        assertEquals("基底配置A", composed.meta.baseProfileName)
+        assertEquals(listOf("香港 IPLC 01", "日本东京 B1"), composed.proxies.map { it.name })
+        assertEquals("规则配置B", composed.proxies.first { it.name == "日本东京 B1" }.originProfileName)
+
+        // Merged proxy groups include donor's AI group and auto-populated picked nodes
+        val aiGroup = composed.proxyGroups.first { it.name == "🤖 AI 专用" }
+        assertTrue("香港 IPLC 01" in aiGroup.proxies)
+        assertTrue("日本东京 B1" in aiGroup.proxies)
+
+        // Donor rules inserted strictly BEFORE MATCH and RULE-SET provider auto-merged!
+        val matchIdx = composed.rules.indexOfFirst { it.type == "MATCH" }
+        val ruleSetIdx = composed.rules.indexOfFirst { it.type == "RULE-SET" && it.payload == "openai-set" }
+        val claudeIdx = composed.rules.indexOfFirst { it.payload == "claude.ai" }
+        assertTrue(ruleSetIdx in 0 until matchIdx)
+        assertTrue(claudeIdx in 0 until matchIdx)
+
+        val compiledYaml = ConfigEngine.compileConfig(composed)
+        val compiledMap = YamlCodec.parseMap(compiledYaml)
+        @Suppress("UNCHECKED_CAST")
+        val compiledProviders = compiledMap["rule-providers"] as Map<String, Any?>
+        assertTrue("openai-set" in compiledProviders)
+
+        // Global node pool deduplicates composed copies & preserves source profile ownership
+        val poolAfterCompose = ConfigEngine.buildGlobalNodePool(listOf(composed, baseProfile, donorProfile))
+        assertEquals(6, poolAfterCompose.size)
+        assertEquals("规则配置B", poolAfterCompose.first { it.node.name == "日本东京 B1" }.originProfileName)
+    }
+
+    @Test
+    fun mixinFromDonorAndSyncNodesFromPoolPreserveDialerProxy() {
+        val base = ConfigEngine.splitConfig(ConfigEngine.SAMPLE_CLASH_YAML, "基底配置")
+        val donorYaml = """
+            proxies:
+              - name: "日本东京 B1"
+                type: trojan
+                server: old-jp.example.com
+                port: 443
+                password: old-password
+                udp: true
+            proxy-groups:
+              - name: "🎬 流媒体"
+                type: select
+                proxies:
+                  - DIRECT
+            rule-providers:
+              netflix-set:
+                type: http
+                behavior: classical
+                url: https://example.com/netflix.yaml
+                path: ./ruleset/netflix.yaml
+                interval: 86400
+            rules:
+              - RULE-SET,netflix-set,🎬 流媒体
+              - MATCH,DIRECT
+        """.trimIndent()
+        val donor = ConfigEngine.splitConfig(donorYaml, "机场B")
+
+        // 1. Mixin group + RULE-SET rule into base
+        val ruleId = donor.rules.first { it.type == "RULE-SET" }.id
+        val (mixed, summary) = ConfigEngine.mixinFromDonor(
+            target = base,
+            donor = donor,
+            selectedGroupNames = setOf("🎬 流媒体"),
+            selectedRuleIds = setOf(ruleId),
+            autoPopulateWithCurrentNodes = true
+        )
+        assertEquals(1, summary.addedGroups)
+        assertEquals(1, summary.addedRules)
+        assertEquals(1, summary.addedProviders)
+        val mediaGroup = mixed.proxyGroups.first { it.name == "🎬 流媒体" }
+        assertTrue("香港 IPLC 01" in mediaGroup.proxies)
+
+        // 2. Compose with donor node, bind dialer-proxy, then update donor node & sync from pool
+        val poolV1 = ConfigEngine.buildGlobalNodePool(listOf(base, donor))
+        val jpEntry = poolV1.first { it.node.name == "日本东京 B1" }
+        val hkEntry = poolV1.first { it.node.name == "香港 IPLC 01" }
+        val composed = ConfigEngine.composeCustomProfile(
+            profileName = "同步测试",
+            baseProfile = base,
+            selectedPoolNodes = listOf(hkEntry, jpEntry)
+        )
+        val jpId = composed.proxies.first { it.name == "日本东京 B1" }.id
+        val boundComposed = composed.copy(
+            proxies = ConfigEngine.applyDialerProxy(composed.proxies, setOf(jpId), "香港 IPLC 01")
+        )
+
+        // Update donor's server & port
+        val updatedDonorNode = ConfigEngine.updateNodeBasicFields(
+            donor.proxies.first(),
+            newName = "日本东京 B1",
+            newServer = "new-jp.example.com",
+            newPort = 8443,
+            newUdp = true,
+            newDialerProxy = null
+        )
+        val updatedDonor = donor.copy(proxies = listOf(updatedDonorNode))
+        val poolV2 = ConfigEngine.buildGlobalNodePool(listOf(boundComposed, base, updatedDonor))
+
+        val (synced, changedCount) = ConfigEngine.syncNodesFromPool(boundComposed, poolV2)
+        assertEquals(1, changedCount)
+        val syncedJp = synced.proxies.first { it.name == "日本东京 B1" }
+        assertEquals("new-jp.example.com", syncedJp.server)
+        assertEquals(8443, syncedJp.port)
+        // Custom dialer-proxy binding must be preserved!
+        assertEquals("香港 IPLC 01", syncedJp.dialerProxy)
+
+        // Re-syncing when nothing changed reports 0 changes
+        val (_, secondChangedCount) = ConfigEngine.syncNodesFromPool(synced, poolV2)
+        assertEquals(0, secondChangedCount)
     }
 }

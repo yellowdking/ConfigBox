@@ -1,5 +1,7 @@
 package com.configbox.app.engine
 
+import com.configbox.app.model.DonorSelection
+import com.configbox.app.model.GlobalPoolNode
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
@@ -19,6 +21,12 @@ data class SubscriptionSyncSummary(
     val addedCount: Int,
     val removedCount: Int,
     val skippedCount: Int
+)
+
+data class MixinSummary(
+    val addedGroups: Int,
+    val addedRules: Int,
+    val addedProviders: Int
 )
 
 /**
@@ -879,6 +887,343 @@ object ConfigEngine {
             )
         )
         return updatedTarget to uniqueNode
+    }
+
+    /**
+     * Aggregates all nodes across every imported profile into a unified Global Node Pool.
+     * Source (non-composed) profiles take canonical ownership first; duplicate copies already
+     * pulled into composed profiles are deduplicated by (name, type, server, port).
+     */
+    fun buildGlobalNodePool(allProfiles: List<SplitProfile>): List<GlobalPoolNode> {
+        val ordered = allProfiles.sortedBy { if (it.meta.isComposed) 1 else 0 }
+        val seenFingerprints = mutableSetOf<String>()
+        val result = mutableListOf<GlobalPoolNode>()
+        for (profile in ordered) {
+            for (node in profile.proxies) {
+                val fp = "${node.name.trim()}|${node.type.lowercase()}|${node.server.lowercase()}|${node.port}"
+                if (!seenFingerprints.add(fp)) continue
+                val originId = node.originProfileId?.takeIf { it.isNotBlank() } ?: profile.meta.id
+                val originName = node.originProfileName?.takeIf { it.isNotBlank() } ?: profile.meta.name
+                val key = "${profile.meta.id}::${node.id}"
+                result.add(
+                    GlobalPoolNode(
+                        key = key,
+                        node = node.copy(originProfileId = originId, originProfileName = originName),
+                        originProfileId = originId,
+                        originProfileName = originName
+                    )
+                )
+            }
+        }
+        return result
+    }
+
+    /**
+     * Composes a brand-new custom [SplitProfile] from:
+     * 1. A chosen [baseProfile] in the Config Pool (providing `baseConfigYaml`, `ruleProvidersYaml`, and optional base groups/rules)
+     * 2. Cherry-picked proxy groups & rules from any number of [donors] in the Config Pool (automatically merging referenced `RULE-SET` providers & inserting rules before `MATCH`)
+     * 3. Chosen nodes from the Global Node Pool ([selectedPoolNodes]), optionally auto-populating [autoPopulateGroups].
+     */
+    fun composeCustomProfile(
+        profileName: String,
+        baseProfile: SplitProfile,
+        includeBaseGroups: Boolean = true,
+        includeBaseRules: Boolean = true,
+        donors: List<DonorSelection> = emptyList(),
+        selectedPoolNodes: List<GlobalPoolNode>,
+        autoPopulateGroups: Set<String> = emptySet()
+    ): SplitProfile {
+        val seenNames = mutableSetOf<String>()
+        val pickedNodes = selectedPoolNodes.map { poolNode ->
+            val rawCopy = poolNode.node.copy(
+                id = UUID.randomUUID().toString().take(8),
+                source = NodeSource.CUSTOM,
+                subscriptionId = null,
+                originProfileId = poolNode.originProfileId,
+                originProfileName = poolNode.originProfileName
+            )
+            val unique = ensureUniqueNodeName(rawCopy, seenNames)
+            seenNames.add(unique.name)
+            unique
+        }
+        val pickedNodeNames = pickedNodes.map { it.name }
+
+        // Build merged proxy groups (losslessly preserving Mihomo extra YAML fields)
+        val mergedGroups = mutableListOf<ProxyGroupEntry>()
+        val existingGroupNames = mutableSetOf<String>()
+
+        if (includeBaseGroups) {
+            for (g in baseProfile.proxyGroups) {
+                if (existingGroupNames.add(g.name)) {
+                    mergedGroups.add(g.copy(id = UUID.randomUUID().toString().take(8)))
+                }
+            }
+        }
+        for (donor in donors) {
+            for (g in donor.donorProfile.proxyGroups) {
+                if (g.name in donor.selectedGroupNames && existingGroupNames.add(g.name)) {
+                    mergedGroups.add(g.copy(id = UUID.randomUUID().toString().take(8)))
+                }
+            }
+        }
+
+        // If user opted not to include any groups at all, create a sensible default select group
+        if (mergedGroups.isEmpty() && pickedNodeNames.isNotEmpty()) {
+            val defaultGroup = buildProxyGroup(
+                name = "🚀 节点选择",
+                type = "select",
+                proxies = pickedNodeNames + listOf("DIRECT")
+            )
+            mergedGroups.add(defaultGroup)
+            existingGroupNames.add(defaultGroup.name)
+        }
+
+        // Auto-populate selected groups with the picked nodes (and clean stale node names from base/donor)
+        val validNamesForGroups = BUILTIN_POLICIES + existingGroupNames + pickedNodeNames.toSet()
+        val finalGroups = mergedGroups.map { group ->
+            val surviving = group.proxies.filter { it in validNamesForGroups }
+            val members = if (group.name in autoPopulateGroups) {
+                (surviving + pickedNodeNames).distinct()
+            } else {
+                surviving.distinct()
+            }
+            buildProxyGroup(
+                id = group.id,
+                name = group.name,
+                type = group.type,
+                proxies = members,
+                url = group.url,
+                interval = group.interval,
+                existingRawYaml = group.rawYaml
+            )
+        }
+
+        // Sanitize dialer-proxy on picked nodes so only valid target names in the new profile are kept
+        val validDialerTargets = existingGroupNames + pickedNodeNames.toSet()
+        val finalNodes = pickedNodes.map { node ->
+            if (!node.dialerProxy.isNullOrBlank() && node.dialerProxy !in validDialerTargets) {
+                updateNodeBasicFields(node, node.name, node.server, node.port, node.udp, null)
+            } else {
+                node
+            }
+        }
+
+        // Build merged rules (cherry-picked donor rules inserted strictly BEFORE MATCH)
+        var finalRules = if (includeBaseRules) {
+            baseProfile.rules.map { it.copy(id = UUID.randomUUID().toString().take(8)) }
+        } else {
+            emptyList()
+        }
+
+        val providersMap = if (baseProfile.ruleProvidersYaml.isNotBlank()) {
+            runCatching { YamlCodec.parseMap(baseProfile.ruleProvidersYaml) }.getOrDefault(linkedMapOf())
+        } else {
+            linkedMapOf()
+        }
+
+        for (donor in donors) {
+            val chosenRules = donor.donorProfile.rules
+                .filter { it.id in donor.selectedRuleIds }
+                .map { it.copy(id = UUID.randomUUID().toString().take(8)) }
+            if (chosenRules.isNotEmpty()) {
+                finalRules = insertRulesBeforeMatch(finalRules, chosenRules)
+                mergeReferencedRuleProviders(providersMap, chosenRules, donor.donorProfile.ruleProvidersYaml)
+            }
+        }
+
+        if (finalRules.isEmpty() && finalGroups.isNotEmpty()) {
+            finalRules = listOf(
+                RuleEntry(type = "GEOIP", payload = "LAN", target = "DIRECT", noResolve = true),
+                RuleEntry(type = "GEOIP", payload = "CN", target = "DIRECT"),
+                RuleEntry(type = "MATCH", payload = "", target = finalGroups.first().name)
+            )
+        }
+
+        val mergedProvidersYaml = if (providersMap.isNotEmpty()) YamlCodec.dump(providersMap) else ""
+        val now = System.currentTimeMillis()
+        val meta = ProfileMeta(
+            name = profileName.trim().ifBlank { "${baseProfile.meta.name} · 定制" },
+            subscriptionUrl = "",
+            createdAt = now,
+            updatedAt = now,
+            nodeCount = finalNodes.size,
+            groupCount = finalGroups.size,
+            ruleCount = finalRules.size,
+            relayBoundCount = finalNodes.count { !it.dialerProxy.isNullOrBlank() },
+            subscriptionCount = 0,
+            isComposed = true,
+            baseProfileName = baseProfile.meta.name
+        )
+
+        return SplitProfile(
+            meta = meta,
+            baseConfigYaml = baseProfile.baseConfigYaml,
+            proxies = finalNodes,
+            proxyGroups = finalGroups,
+            rules = finalRules,
+            ruleProvidersYaml = mergedProvidersYaml,
+            nodeSubscriptions = emptyList()
+        )
+    }
+
+    /**
+     * Mixes cherry-picked proxy groups and rules (plus referenced `RULE-SET` providers)
+     * from [donor] into an existing [target] profile without clobbering existing edits.
+     */
+    fun mixinFromDonor(
+        target: SplitProfile,
+        donor: SplitProfile,
+        selectedGroupNames: Set<String>,
+        selectedRuleIds: Set<String>,
+        autoPopulateWithCurrentNodes: Boolean = false
+    ): Pair<SplitProfile, MixinSummary> {
+        val currentNodeNames = target.proxies.map { it.name }
+        val existingGroupNames = target.proxyGroups.map { it.name }.toMutableSet()
+        val addedGroups = mutableListOf<ProxyGroupEntry>()
+
+        for (g in donor.proxyGroups) {
+            if (g.name in selectedGroupNames && existingGroupNames.add(g.name)) {
+                val members = if (autoPopulateWithCurrentNodes && currentNodeNames.isNotEmpty()) {
+                    (g.proxies.filter { it in BUILTIN_POLICIES || it in existingGroupNames } + currentNodeNames).distinct()
+                } else {
+                    g.proxies
+                }
+                addedGroups.add(
+                    buildProxyGroup(
+                        name = g.name,
+                        type = g.type,
+                        proxies = members,
+                        url = g.url,
+                        interval = g.interval,
+                        existingRawYaml = g.rawYaml
+                    )
+                )
+            }
+        }
+        val mergedGroups = target.proxyGroups + addedGroups
+
+        val chosenRules = donor.rules
+            .filter { it.id in selectedRuleIds }
+            .map { it.copy(id = UUID.randomUUID().toString().take(8)) }
+        val beforeRuleCount = target.rules.size
+        val mergedRules = if (chosenRules.isNotEmpty()) {
+            insertRulesBeforeMatch(target.rules, chosenRules)
+        } else {
+            target.rules
+        }
+        val addedRuleCount = mergedRules.size - beforeRuleCount
+
+        val providersMap = if (target.ruleProvidersYaml.isNotBlank()) {
+            runCatching { YamlCodec.parseMap(target.ruleProvidersYaml) }.getOrDefault(linkedMapOf())
+        } else {
+            linkedMapOf()
+        }
+        val beforeProviderCount = providersMap.size
+        if (chosenRules.isNotEmpty()) {
+            mergeReferencedRuleProviders(providersMap, chosenRules, donor.ruleProvidersYaml)
+        }
+        val addedProviders = providersMap.size - beforeProviderCount
+        val mergedProvidersYaml = if (providersMap.isNotEmpty()) YamlCodec.dump(providersMap) else ""
+
+        val updated = target.copy(
+            proxyGroups = mergedGroups,
+            rules = mergedRules,
+            ruleProvidersYaml = mergedProvidersYaml,
+            meta = target.meta.copy(
+                updatedAt = System.currentTimeMillis(),
+                groupCount = mergedGroups.size,
+                ruleCount = mergedRules.size
+            )
+        )
+        return updated to MixinSummary(
+            addedGroups = addedGroups.size,
+            addedRules = addedRuleCount,
+            addedProviders = addedProviders
+        )
+    }
+
+    /**
+     * Refreshes matching nodes in [target] from the latest definitions in [globalPool]
+     * while preserving each node's custom `dialer-proxy` binding, order, groups, and rules.
+     */
+    fun syncNodesFromPool(
+        target: SplitProfile,
+        globalPool: List<GlobalPoolNode>
+    ): Pair<SplitProfile, Int> {
+        val byOriginAndName = globalPool.associateBy { "${it.originProfileId}::${it.node.name}" }
+        val byName = globalPool.associateBy { it.node.name }
+        var syncedCount = 0
+
+        val refreshedNodes = target.proxies.map { node ->
+            val match = node.originProfileId?.let { byOriginAndName["$it::${node.name}"] }
+                ?: byName[node.name]
+            if (match != null && match.originProfileId != target.meta.id) {
+                val fresh = match.node
+                val merged = updateNodeBasicFields(
+                    node = fresh.copy(
+                        id = node.id,
+                        source = node.source,
+                        subscriptionId = node.subscriptionId,
+                        originProfileId = match.originProfileId,
+                        originProfileName = match.originProfileName
+                    ),
+                    newName = node.name,
+                    newServer = fresh.server,
+                    newPort = fresh.port,
+                    newUdp = fresh.udp,
+                    newDialerProxy = node.dialerProxy
+                )
+                if (merged.rawYaml != node.rawYaml || merged.server != node.server || merged.port != node.port) {
+                    syncedCount++
+                }
+                merged
+            } else {
+                node
+            }
+        }
+
+        val updated = target.copy(
+            proxies = refreshedNodes,
+            meta = target.meta.copy(
+                updatedAt = System.currentTimeMillis(),
+                nodeCount = refreshedNodes.size,
+                relayBoundCount = refreshedNodes.count { !it.dialerProxy.isNullOrBlank() }
+            )
+        )
+        return updated to syncedCount
+    }
+
+    private fun insertRulesBeforeMatch(existing: List<RuleEntry>, incoming: List<RuleEntry>): List<RuleEntry> {
+        val seenKeys = existing.map { it.toClashRuleString().lowercase() }.toMutableSet()
+        val uniqueIncoming = incoming.filter { rule ->
+            seenKeys.add(rule.toClashRuleString().lowercase())
+        }
+        if (uniqueIncoming.isEmpty()) return existing
+        val matchIdx = existing.indexOfFirst { it.type.equals("MATCH", ignoreCase = true) }
+        return if (matchIdx >= 0) {
+            existing.subList(0, matchIdx) + uniqueIncoming + existing.subList(matchIdx, existing.size)
+        } else {
+            existing + uniqueIncoming
+        }
+    }
+
+    private fun mergeReferencedRuleProviders(
+        targetProviders: LinkedHashMap<String, Any?>,
+        rules: List<RuleEntry>,
+        donorProvidersYaml: String
+    ) {
+        if (donorProvidersYaml.isBlank()) return
+        val neededProviders = rules
+            .filter { it.type.equals("RULE-SET", ignoreCase = true) && it.payload.isNotBlank() }
+            .map { it.payload.trim() }
+            .toSet()
+        if (neededProviders.isEmpty()) return
+        val donorMap = runCatching { YamlCodec.parseMap(donorProvidersYaml) }.getOrNull() ?: return
+        for (providerName in neededProviders) {
+            if (providerName !in targetProviders && providerName in donorMap) {
+                targetProviders[providerName] = YamlCodec.deepCopy(donorMap[providerName])
+            }
+        }
     }
 
     private fun mapToProxyNode(

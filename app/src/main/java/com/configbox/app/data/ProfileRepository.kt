@@ -14,12 +14,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
+
+@Serializable
+private data class NodeOriginRef(
+    val profileId: String,
+    val profileName: String
+)
 
 /**
  * Persists each split profile into its own modular directory:
@@ -72,6 +79,11 @@ class ProfileRepository(context: Context) {
         }
     }
 
+    suspend fun loadAllProfiles(): List<SplitProfile> = withContext(Dispatchers.IO) {
+        val metas = listProfiles()
+        metas.mapNotNull { loadProfile(it.id) }
+    }
+
     suspend fun loadProfile(profileId: String): SplitProfile? = withContext(Dispatchers.IO) {
         ioMutex.withLock {
             if (!SAFE_ID_REGEX.matches(profileId)) return@withLock null
@@ -90,13 +102,29 @@ class ProfileRepository(context: Context) {
             val subMap = File(dir, "node_sub_map.json").takeIf { it.exists() }?.let {
                 runCatching { json.decodeFromString<Map<String, String>>(it.readText()) }.getOrDefault(emptyMap())
             } ?: emptyMap()
+            val originMap = File(dir, "node_origins.json").takeIf { it.exists() }?.let {
+                runCatching { json.decodeFromString<Map<String, NodeOriginRef>>(it.readText()) }.getOrDefault(emptyMap())
+            } ?: emptyMap()
 
             val subProxies = readProxyListFile(File(dir, "proxies.yaml"), NodeSource.SUBSCRIPTION)
                 .map { node ->
                     val subId = subMap[node.name]?.takeIf { it in validSubIds }
-                    if (subId != null) node.copy(subscriptionId = subId) else node
+                    val origin = originMap[node.name]
+                    node.copy(
+                        subscriptionId = subId,
+                        originProfileId = origin?.profileId,
+                        originProfileName = origin?.profileName
+                    )
                 }
             val customProxies = readProxyListFile(File(dir, "custom_proxies.yaml"), NodeSource.CUSTOM)
+                .map { node ->
+                    val origin = originMap[node.name]
+                    if (origin != null) {
+                        node.copy(originProfileId = origin.profileId, originProfileName = origin.profileName)
+                    } else {
+                        node
+                    }
+                }
             val combined = subProxies + customProxies
 
             // Restore exact user-defined node order if persisted
@@ -161,6 +189,19 @@ class ProfileRepository(context: Context) {
                 .mapNotNull { node -> node.subscriptionId?.let { node.name to it } }
                 .toMap()
             writeTextAtomic(File(dir, "node_sub_map.json"), json.encodeToString(subMap))
+
+            val originMap = updated.proxies
+                .mapNotNull { node ->
+                    val pid = node.originProfileId
+                    val pname = node.originProfileName
+                    if (!pid.isNullOrBlank() && !pname.isNullOrBlank()) {
+                        node.name to NodeOriginRef(pid, pname)
+                    } else {
+                        null
+                    }
+                }
+                .toMap()
+            writeTextAtomic(File(dir, "node_origins.json"), json.encodeToString(originMap))
 
             writeGroupListFile(File(dir, "groups.yaml"), updated.proxyGroups)
             writeTextAtomic(File(dir, "rules.json"), json.encodeToString(updated.rules))

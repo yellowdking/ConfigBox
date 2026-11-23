@@ -22,7 +22,9 @@ data class ProfileMeta(
     val groupCount: Int = 0,
     val ruleCount: Int = 0,
     val relayBoundCount: Int = 0,
-    val subscriptionCount: Int = 0
+    val subscriptionCount: Int = 0,
+    val isComposed: Boolean = false,
+    val baseProfileName: String = ""
 )
 
 /**
@@ -54,7 +56,28 @@ data class ProxyNode(
     val dialerProxy: String? = null,
     val source: NodeSource = NodeSource.SUBSCRIPTION,
     val subscriptionId: String? = null,
+    val originProfileId: String? = null,
+    val originProfileName: String? = null,
     val rawYaml: String
+)
+
+/**
+ * A node entry exposed in the unified Global Node Pool aggregated across all imported profiles.
+ */
+data class GlobalPoolNode(
+    val key: String,
+    val node: ProxyNode,
+    val originProfileId: String,
+    val originProfileName: String
+)
+
+/**
+ * Cherry-picked groups & rules from a donor profile in the Config Pool.
+ */
+data class DonorSelection(
+    val donorProfile: SplitProfile,
+    val selectedGroupNames: Set<String> = emptySet(),
+    val selectedRuleIds: Set<String> = emptySet()
 )
 
 /**

@@ -31,8 +31,10 @@ import androidx.compose.material.icons.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
+import androidx.compose.material.icons.outlined.PlaylistAdd
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material3.AlertDialog
@@ -71,6 +73,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.configbox.app.engine.LatencyResult
 import com.configbox.app.engine.NodeNetworkTools
+import com.configbox.app.model.GlobalPoolNode
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
@@ -106,7 +109,7 @@ fun NodesScreen(
         return
     }
 
-    var subTab by remember { mutableIntStateOf(0) } // 0 = 全部节点, 1 = 节点订阅, 2 = 中转绑定
+    var subTab by remember { mutableIntStateOf(0) } // 0 = 当前节点, 1 = 全局节点池, 2 = 节点订阅, 3 = 中转绑定
     var searchQuery by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf("全部") }
     var showAddNodeDialog by remember { mutableStateOf(false) }
@@ -186,17 +189,22 @@ fun NodesScreen(
                 Tab(
                     selected = subTab == 0,
                     onClick = { subTab = 0 },
-                    text = { Text("全部节点 (${active.proxies.size})", fontSize = 12.sp, maxLines = 1) }
+                    text = { Text("当前(${active.proxies.size})", fontSize = 11.sp, maxLines = 1) }
                 )
                 Tab(
                     selected = subTab == 1,
                     onClick = { subTab = 1 },
-                    text = { Text("节点订阅 (${active.nodeSubscriptions.size})", fontSize = 12.sp, maxLines = 1) }
+                    text = { Text("节点池(${uiState.globalNodePool.size})", fontSize = 11.sp, maxLines = 1) }
                 )
                 Tab(
                     selected = subTab == 2,
                     onClick = { subTab = 2 },
-                    text = { Text("中转绑定 (${relayedNodes.size})", fontSize = 12.sp, maxLines = 1) }
+                    text = { Text("订阅(${active.nodeSubscriptions.size})", fontSize = 11.sp, maxLines = 1) }
+                )
+                Tab(
+                    selected = subTab == 3,
+                    onClick = { subTab = 3 },
+                    text = { Text("中转(${relayedNodes.size})", fontSize = 11.sp, maxLines = 1) }
                 )
             }
 
@@ -319,6 +327,21 @@ fun NodesScreen(
                 }
 
                 1 -> {
+                    GlobalNodePoolPane(
+                        activeProfileName = active.meta.name,
+                        pool = uiState.globalNodePool,
+                        poolLatencies = uiState.poolLatencies,
+                        isTestingPool = uiState.isTestingPoolLatencies,
+                        currentGroupNames = groupNames,
+                        onTestOne = { viewModel.testPoolNodeLatency(it) },
+                        onTestBatch = { viewModel.testGlobalPoolLatencies(it) },
+                        onAddToActive = { keys, targetGroups ->
+                            viewModel.addNodesFromGlobalPool(keys, targetGroups)
+                        }
+                    )
+                }
+
+                2 -> {
                     NodeSubscriptionsPane(
                         subscriptions = active.nodeSubscriptions,
                         isLoading = uiState.isLoading,
@@ -413,32 +436,34 @@ fun NodesScreen(
             }
         }
 
-        FloatingActionButton(
-            onClick = {
-                when (subTab) {
-                    0 -> showAddNodeDialog = true
-                    1 -> showAddSubDialog = true
-                    else -> showRelayBindDialog = true
-                }
-            },
-            containerColor = SkyAccent,
-            contentColor = PureWhite,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp)
-        ) {
-            Icon(
-                imageVector = when (subTab) {
-                    0 -> Icons.Outlined.Add
-                    1 -> Icons.Outlined.CloudDownload
-                    else -> Icons.Outlined.Link
+        if (subTab != 1) {
+            FloatingActionButton(
+                onClick = {
+                    when (subTab) {
+                        0 -> showAddNodeDialog = true
+                        2 -> showAddSubDialog = true
+                        else -> showRelayBindDialog = true
+                    }
                 },
-                contentDescription = when (subTab) {
-                    0 -> "添加节点"
-                    1 -> "添加节点订阅"
-                    else -> "绑定中转"
-                }
-            )
+                containerColor = SkyAccent,
+                contentColor = PureWhite,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp)
+            ) {
+                Icon(
+                    imageVector = when (subTab) {
+                        0 -> Icons.Outlined.Add
+                        2 -> Icons.Outlined.CloudDownload
+                        else -> Icons.Outlined.Link
+                    },
+                    contentDescription = when (subTab) {
+                        0 -> "添加节点"
+                        2 -> "添加节点订阅"
+                        else -> "绑定中转"
+                    }
+                )
+            }
         }
     }
 
@@ -1030,6 +1055,9 @@ private fun NodeCard(
                     } else if (!subscriptionName.isNullOrBlank()) {
                         Spacer(Modifier.width(4.dp))
                         BadgeTag(subscriptionName, AmberBadge)
+                    } else if (!node.originProfileName.isNullOrBlank()) {
+                        Spacer(Modifier.width(4.dp))
+                        BadgeTag("池:${node.originProfileName}", AmberBadge)
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -1754,6 +1782,344 @@ private fun ImportFromProfileDialog(
                 }
             ) {
                 Text("引入 (${selectedNodeIds.size})")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun GlobalNodePoolPane(
+    activeProfileName: String,
+    pool: List<GlobalPoolNode>,
+    poolLatencies: Map<String, LatencyResult>,
+    isTestingPool: Boolean,
+    currentGroupNames: List<String>,
+    onTestOne: (String) -> Unit,
+    onTestBatch: (List<String>) -> Unit,
+    onAddToActive: (Set<String>, List<String>) -> Unit
+) {
+    var search by remember { mutableStateOf("") }
+    var sourceFilter by remember { mutableStateOf("全部来源") }
+    var protocolFilter by remember { mutableStateOf("全部协议") }
+    var sortByLatency by remember { mutableStateOf(false) }
+    var selectedKeys by remember { mutableStateOf(setOf<String>()) }
+    var showTargetGroupsDialog by remember { mutableStateOf(false) }
+
+    val sources = remember(pool) {
+        listOf("全部来源") + pool.map { it.originProfileName }.distinct()
+    }
+    val protocols = remember(pool) {
+        listOf("全部协议") + pool.map { it.node.type.uppercase() }.distinct().sorted()
+    }
+
+    val effectiveSource = if (sourceFilter in sources) sourceFilter else "全部来源"
+    val effectiveProto = if (protocolFilter in protocols) protocolFilter else "全部协议"
+
+    val filtered = remember(pool, search, effectiveSource, effectiveProto, sortByLatency, poolLatencies) {
+        val base = pool.filter { entry ->
+            val matchSrc = effectiveSource == "全部来源" || entry.originProfileName == effectiveSource
+            val matchProto = effectiveProto == "全部协议" || entry.node.type.equals(effectiveProto, ignoreCase = true)
+            val matchQ = search.isBlank() ||
+                entry.node.name.contains(search, ignoreCase = true) ||
+                entry.node.server.contains(search, ignoreCase = true) ||
+                entry.originProfileName.contains(search, ignoreCase = true)
+            matchSrc && matchProto && matchQ
+        }
+        if (sortByLatency) {
+            base.sortedBy { poolLatencies[it.key]?.latencyMs ?: Int.MAX_VALUE }
+        } else {
+            base
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Surface(color = PureWhite) {
+                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    OutlinedTextField(
+                        value = search,
+                        onValueChange = { search = it },
+                        placeholder = { Text("搜索全局节点池（名称 / 地址 / 来源配置）...", fontSize = 13.sp) },
+                        leadingIcon = { Icon(Icons.Outlined.Search, null, Modifier.size(18.dp)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        sources.forEach { src ->
+                            FilterChip(
+                                selected = effectiveSource == src,
+                                onClick = { sourceFilter = src },
+                                label = { Text(src, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        protocols.forEach { proto ->
+                            FilterChip(
+                                selected = effectiveProto == proto,
+                                onClick = { protocolFilter = proto },
+                                label = { Text(proto, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = { onTestBatch(filtered.map { it.key }) },
+                            enabled = !isTestingPool && filtered.isNotEmpty(),
+                            border = BorderStroke(1.dp, BorderGray),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Outlined.Speed, null, Modifier.size(15.dp), tint = SkyAccent)
+                            Spacer(Modifier.width(4.dp))
+                            Text(if (isTestingPool) "测速中..." else "一键测速", fontSize = 12.sp, color = SlateInk)
+                        }
+                        FilterChip(
+                            selected = sortByLatency,
+                            onClick = { sortByLatency = !sortByLatency },
+                            leadingIcon = { Icon(Icons.Outlined.Sort, null, Modifier.size(15.dp)) },
+                            label = { Text("按延迟排序", fontSize = 12.sp) }
+                        )
+                        TextButton(
+                            onClick = { selectedKeys = selectedKeys + filtered.map { it.key } },
+                            contentPadding = PaddingValues(horizontal = 6.dp)
+                        ) {
+                            Text("全选筛选", fontSize = 12.sp)
+                        }
+                        if (selectedKeys.isNotEmpty()) {
+                            TextButton(
+                                onClick = { selectedKeys = emptySet() },
+                                contentPadding = PaddingValues(horizontal = 6.dp)
+                            ) {
+                                Text("清空(${selectedKeys.size})", fontSize = 12.sp, color = RoseDanger)
+                            }
+                        }
+                    }
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    start = 16.dp,
+                    end = 16.dp,
+                    top = 10.dp,
+                    bottom = if (selectedKeys.isNotEmpty()) 88.dp else 24.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                item(key = "pool_hint") {
+                    Text(
+                        text = "汇总所有已导入配置的去重节点（共 ${pool.size} 个）· 点选节点可批量加入「$activeProfileName」",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+                if (filtered.isEmpty()) {
+                    item(key = "pool_empty") {
+                        Surface(
+                            color = PureWhite,
+                            border = BorderStroke(1.dp, BorderGray),
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "当前筛选条件下没有匹配的节点池条目。",
+                                modifier = Modifier.padding(20.dp),
+                                fontSize = 13.sp,
+                                color = SlateMuted
+                            )
+                        }
+                    }
+                } else {
+                    items(filtered, key = { it.key }) { entry ->
+                        val isSelected = entry.key in selectedKeys
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedKeys = if (isSelected) selectedKeys - entry.key else selectedKeys + entry.key
+                                },
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isSelected) EmeraldActive.copy(alpha = 0.08f) else PureWhite
+                            ),
+                            border = BorderStroke(
+                                if (isSelected) 1.5.dp else 1.dp,
+                                if (isSelected) EmeraldActive else BorderGray
+                            ),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = entry.node.name,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (isSelected) EmeraldActive else SlateInk,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        BadgeTag(entry.node.type.uppercase(), SkyAccent)
+                                        Spacer(Modifier.width(4.dp))
+                                        BadgeTag("来自:${entry.originProfileName}", AmberBadge)
+                                    }
+                                    Spacer(Modifier.height(4.dp))
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = "${entry.node.server}:${entry.node.port}",
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 12.sp,
+                                            color = SlateMuted,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        LatencyChip(
+                                            latency = poolLatencies[entry.key],
+                                            onClick = { onTestOne(entry.key) }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (selectedKeys.isNotEmpty()) {
+            Surface(
+                color = PureWhite,
+                border = BorderStroke(1.dp, EmeraldActive),
+                shadowElevation = 4.dp,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "已挑选 ${selectedKeys.size} 个池节点",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SlateInk
+                    )
+                    Button(
+                        onClick = {
+                            if (currentGroupNames.isEmpty()) {
+                                onAddToActive(selectedKeys, emptyList())
+                                selectedKeys = emptySet()
+                            } else {
+                                showTargetGroupsDialog = true
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldActive)
+                    ) {
+                        Icon(Icons.Outlined.PlaylistAdd, null, Modifier.size(17.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("加入当前配置", fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+    }
+
+    if (showTargetGroupsDialog) {
+        AddPoolNodesToProfileDialog(
+            activeProfileName = activeProfileName,
+            selectedCount = selectedKeys.size,
+            groupNames = currentGroupNames,
+            onDismiss = { showTargetGroupsDialog = false },
+            onConfirm = { chosenGroups ->
+                showTargetGroupsDialog = false
+                onAddToActive(selectedKeys, chosenGroups)
+                selectedKeys = emptySet()
+            }
+        )
+    }
+}
+
+@Composable
+private fun AddPoolNodesToProfileDialog(
+    activeProfileName: String,
+    selectedCount: Int,
+    groupNames: List<String>,
+    onDismiss: () -> Unit,
+    onConfirm: (List<String>) -> Unit
+) {
+    var selectedGroups by remember { mutableStateOf(setOf<String>()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("加入「$activeProfileName」") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "将把已挑选的 $selectedCount 个全局节点池节点加入到当前配置。可选择顺便填入哪些策略组：",
+                    fontSize = 12.sp,
+                    color = SlateMuted
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    groupNames.forEach { gName ->
+                        val sel = gName in selectedGroups
+                        FilterChip(
+                            selected = sel,
+                            onClick = {
+                                selectedGroups = if (sel) selectedGroups - gName else selectedGroups + gName
+                            },
+                            label = { Text(gName, fontSize = 12.sp) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldActive),
+                onClick = { onConfirm(groupNames.filter { it in selectedGroups }) }
+            ) {
+                Text("确认加入")
             }
         },
         dismissButton = {

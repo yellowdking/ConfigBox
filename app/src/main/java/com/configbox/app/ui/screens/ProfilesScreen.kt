@@ -21,12 +21,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Science
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -74,6 +76,7 @@ fun ProfilesScreen(
     val context = LocalContext.current
     var showUrlDialog by remember { mutableStateOf(false) }
     var showPasteDialog by remember { mutableStateOf(false) }
+    var showComposeDialog by remember { mutableStateOf(false) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -105,10 +108,14 @@ fun ProfilesScreen(
         ) {
             item {
                 ImportActionsCard(
+                    profileCount = uiState.profiles.size,
+                    poolNodeCount = uiState.globalNodePool.size,
+                    canCompose = uiState.allProfiles.isNotEmpty(),
                     onPickFile = { filePickerLauncher.launch(arrayOf("*/*")) },
                     onImportUrl = { showUrlDialog = true },
                     onPasteYaml = { showPasteDialog = true },
-                    onImportDemo = { viewModel.importDemoProfile() }
+                    onImportDemo = { viewModel.importDemoProfile() },
+                    onComposeNew = { showComposeDialog = true }
                 )
             }
 
@@ -130,7 +137,7 @@ fun ProfilesScreen(
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                text = "初次导入会自动将节点、策略组、规则与基础配置拆分独立保存，后续互不覆盖。",
+                                text = "导入后自动拆分为「配置池」与「全局节点池」，可在任意基底上自由混入其他配置的策略组、规则并挑选节点。",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = SlateMuted
                             )
@@ -140,7 +147,7 @@ fun ProfilesScreen(
             } else {
                 item {
                     Text(
-                        text = "已拆分配置 (${uiState.profiles.size})",
+                        text = "配置池 (${uiState.profiles.size}) · 全局节点池 (${uiState.globalNodePool.size} 节点)",
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.padding(top = 4.dp)
                     )
@@ -153,11 +160,34 @@ fun ProfilesScreen(
                         isActive = isActive,
                         onSelect = { viewModel.selectProfile(profile.id) },
                         onRefreshSub = { viewModel.refreshSubscriptionNodes(profile.id) },
+                        onSyncPool = { viewModel.syncProfileFromGlobalPool(profile.id) },
                         onDelete = { viewModel.deleteProfile(profile.id) }
                     )
                 }
             }
         }
+    }
+
+    if (showComposeDialog && uiState.allProfiles.isNotEmpty()) {
+        ComposeProfileDialog(
+            allProfiles = uiState.allProfiles,
+            globalNodePool = uiState.globalNodePool,
+            poolLatencies = uiState.poolLatencies,
+            onDismiss = { showComposeDialog = false },
+            onCompose = { name, baseId, incBaseGroups, incBaseRules, donorGroups, donorRules, poolKeys, autoGroups ->
+                showComposeDialog = false
+                viewModel.composeCustomProfile(
+                    profileName = name,
+                    baseProfileId = baseId,
+                    includeBaseGroups = incBaseGroups,
+                    includeBaseRules = incBaseRules,
+                    donorGroupMap = donorGroups,
+                    donorRuleMap = donorRules,
+                    selectedPoolKeys = poolKeys,
+                    autoPopulateGroups = autoGroups
+                )
+            }
+        )
     }
 
     if (showUrlDialog) {
@@ -183,10 +213,14 @@ fun ProfilesScreen(
 
 @Composable
 private fun ImportActionsCard(
+    profileCount: Int,
+    poolNodeCount: Int,
+    canCompose: Boolean,
     onPickFile: () -> Unit,
     onImportUrl: () -> Unit,
     onPasteYaml: () -> Unit,
-    onImportDemo: () -> Unit
+    onImportDemo: () -> Unit,
+    onComposeNew: () -> Unit
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = PureWhite),
@@ -195,12 +229,12 @@ private fun ImportActionsCard(
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "导入并自动拆分 Clash 配置",
+                text = "导入配置入池 · 自由撮合定制",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "导入后自动分离 proxies / proxy-groups / rules / 基础设置，可在「节点 → 节点订阅」中继续叠加多个外部订阅源。",
+                text = "每个导入的配置都会自动拆分为「配置池」与「全局节点池」；选定基底后可混入任意配置的策略组/规则并自由挑节点。",
                 fontSize = 12.sp,
                 color = SlateMuted
             )
@@ -252,6 +286,27 @@ private fun ImportActionsCard(
                     Text("示例配置", fontSize = 13.sp, color = SlateInk)
                 }
             }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onComposeNew,
+                enabled = canCompose,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = EmeraldActive,
+                    contentColor = PureWhite
+                )
+            ) {
+                Icon(Icons.Outlined.AutoAwesome, null, Modifier.size(17.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (canCompose) {
+                        "撮合新建配置（配置池 $profileCount · 节点池 $poolNodeCount）"
+                    } else {
+                        "撮合新建配置（请先导入至少 1 份配置）"
+                    },
+                    fontSize = 13.sp
+                )
+            }
         }
     }
 }
@@ -262,6 +317,7 @@ private fun ProfileCard(
     isActive: Boolean,
     onSelect: () -> Unit,
     onRefreshSub: () -> Unit,
+    onSyncPool: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -283,10 +339,26 @@ private fun ProfileCard(
                             text = profile.name,
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
                         )
+                        if (profile.isComposed) {
+                            Spacer(Modifier.width(6.dp))
+                            Surface(
+                                color = SkyAccent.copy(alpha = 0.12f),
+                                shape = MaterialTheme.shapes.extraSmall
+                            ) {
+                                Text(
+                                    text = "撮合配置",
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = SkyAccent
+                                )
+                            }
+                        }
                         if (isActive) {
-                            Spacer(Modifier.width(8.dp))
+                            Spacer(Modifier.width(6.dp))
                             Surface(
                                 color = EmeraldActive.copy(alpha = 0.12f),
                                 shape = MaterialTheme.shapes.extraSmall
@@ -301,7 +373,16 @@ private fun ProfileCard(
                             }
                         }
                     }
-                    if (profile.subscriptionUrl.isNotBlank()) {
+                    if (profile.isComposed && profile.baseProfileName.isNotBlank()) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "基底配置：${profile.baseProfileName}",
+                            fontSize = 11.sp,
+                            color = SlateMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    } else if (profile.subscriptionUrl.isNotBlank()) {
                         Spacer(Modifier.height(2.dp))
                         Text(
                             text = profile.subscriptionUrl,
@@ -311,6 +392,11 @@ private fun ProfileCard(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                    }
+                }
+                if (profile.isComposed) {
+                    IconButton(onClick = onSyncPool) {
+                        Icon(Icons.Outlined.Sync, contentDescription = "同步全局节点池最新参数", tint = EmeraldActive)
                     }
                 }
                 if (profile.subscriptionUrl.isNotBlank()) {

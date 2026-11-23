@@ -26,6 +26,7 @@ import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.DragIndicator
+import androidx.compose.material.icons.outlined.MergeType
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -36,6 +37,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -94,6 +96,11 @@ fun GroupsScreen(
 
     var editingGroup by remember { mutableStateOf<ProxyGroupEntry?>(null) }
     var isNewGroup by remember { mutableStateOf(false) }
+    var showMixinDialog by remember { mutableStateOf(false) }
+
+    val donorProfiles = remember(uiState.allProfiles, active.meta.id) {
+        uiState.allProfiles.filter { it.meta.id != active.meta.id && it.proxyGroups.isNotEmpty() }
+    }
 
     val relayedNodeNames = remember(active.proxies) {
         active.proxies.filter { !it.dialerProxy.isNullOrBlank() }.map { it.name }.toSet()
@@ -118,10 +125,29 @@ fun GroupsScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item(key = "groups_hint") {
-                Text(
-                    text = "共 ${active.proxyGroups.size} 个策略组 · 长按卡片上下拖动排序 · 点击编辑",
-                    style = MaterialTheme.typography.labelMedium
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "共 ${active.proxyGroups.size} 个策略组 · 长按拖动排序",
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (donorProfiles.isNotEmpty()) {
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = { showMixinDialog = true },
+                            border = BorderStroke(1.dp, BorderGray),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Outlined.MergeType, null, Modifier.size(15.dp), tint = SkyAccent)
+                            Spacer(Modifier.width(4.dp))
+                            Text("从配置池混入", fontSize = 12.sp, color = SlateInk)
+                        }
+                    }
+                }
             }
 
             itemsIndexed(active.proxyGroups, key = { _, it -> it.id }) { idx, group ->
@@ -157,6 +183,24 @@ fun GroupsScreen(
         ) {
             Icon(Icons.Outlined.Add, contentDescription = "新建策略组")
         }
+    }
+
+    if (showMixinDialog && donorProfiles.isNotEmpty()) {
+        MixinFromPoolDialog(
+            title = "从配置池混入策略组",
+            modeGroupsOnly = true,
+            donorProfiles = donorProfiles,
+            onDismiss = { showMixinDialog = false },
+            onConfirm = { donorId, groupNames, _, populateWithCurrentNodes ->
+                showMixinDialog = false
+                viewModel.mixinFromDonorProfile(
+                    donorProfileId = donorId,
+                    selectedGroupNames = groupNames,
+                    selectedRuleIds = emptySet(),
+                    autoPopulateWithCurrentNodes = populateWithCurrentNodes
+                )
+            }
+        )
     }
 
     editingGroup?.let { group ->

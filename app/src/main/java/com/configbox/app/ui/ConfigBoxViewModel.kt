@@ -8,6 +8,8 @@ import com.configbox.app.engine.ConfigEngine
 import com.configbox.app.engine.LatencyResult
 import com.configbox.app.engine.NodeNetworkTools
 import com.configbox.app.engine.ProxyUriParser
+import com.configbox.app.model.DonorSelection
+import com.configbox.app.model.GlobalPoolNode
 import com.configbox.app.model.NodeSource
 import com.configbox.app.model.NodeSubscription
 import com.configbox.app.model.ProfileMeta
@@ -33,11 +35,15 @@ import java.util.UUID
 
 data class ConfigBoxUiState(
     val profiles: List<ProfileMeta> = emptyList(),
+    val allProfiles: List<SplitProfile> = emptyList(),
+    val globalNodePool: List<GlobalPoolNode> = emptyList(),
     val activeProfile: SplitProfile? = null,
     val compiledYaml: String = "",
     val isLoading: Boolean = false,
     val isTestingAllLatencies: Boolean = false,
+    val isTestingPoolLatencies: Boolean = false,
     val nodeLatencies: Map<String, LatencyResult> = emptyMap(),
+    val poolLatencies: Map<String, LatencyResult> = emptyMap(),
     val serverRunning: Boolean = false,
     val serverPort: Int = 18080,
     val snackbarMessage: String? = null
@@ -74,19 +80,30 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(snackbarMessage = msg) }
     }
 
+    private suspend fun loadPoolsSnapshot(): Triple<List<ProfileMeta>, List<SplitProfile>, List<GlobalPoolNode>> {
+        val allLoaded = repository.loadAllProfiles()
+        val metas = allLoaded.map { it.meta }
+        val pool = withContext(Dispatchers.Default) {
+            ConfigEngine.buildGlobalNodePool(allLoaded)
+        }
+        return Triple(metas, allLoaded, pool)
+    }
+
     fun loadAllProfiles() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             runCatching {
-                val list = repository.listProfiles()
+                val (list, allLoaded, pool) = loadPoolsSnapshot()
                 val currentId = _uiState.value.activeProfile?.meta?.id ?: list.firstOrNull()?.id
-                val loaded = currentId?.let { repository.loadProfile(it) }
+                val loaded = allLoaded.firstOrNull { it.meta.id == currentId }
                 val compiled = loaded?.let {
                     withContext(Dispatchers.Default) { ConfigEngine.compileConfig(it) }
                 }.orEmpty()
                 _uiState.update {
                     it.copy(
                         profiles = list,
+                        allProfiles = allLoaded,
+                        globalNodePool = pool,
                         activeProfile = loaded,
                         compiledYaml = compiled,
                         isLoading = false
@@ -132,17 +149,19 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     ConfigEngine.splitConfig(rawYaml, name, subscriptionUrl)
                 }
                 val saved = repository.saveProfile(split)
-                val list = repository.listProfiles()
+                val (list, allLoaded, pool) = loadPoolsSnapshot()
                 val compiled = withContext(Dispatchers.Default) {
                     ConfigEngine.compileConfig(saved)
                 }
                 _uiState.update {
                     it.copy(
                         profiles = list,
+                        allProfiles = allLoaded,
+                        globalNodePool = pool,
                         activeProfile = saved,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "已自动拆分：${saved.proxies.size} 节点 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
+                        snackbarMessage = "已拆分入池：${saved.proxies.size} 节点加入节点池 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
                     )
                 }
             }.onFailure { err ->
@@ -162,17 +181,19 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     ConfigEngine.splitConfig(rawYaml, name.ifBlank { "订阅配置" }, url)
                 }
                 val saved = repository.saveProfile(split)
-                val list = repository.listProfiles()
+                val (list, allLoaded, pool) = loadPoolsSnapshot()
                 val compiled = withContext(Dispatchers.Default) {
                     ConfigEngine.compileConfig(saved)
                 }
                 _uiState.update {
                     it.copy(
                         profiles = list,
+                        allProfiles = allLoaded,
+                        globalNodePool = pool,
                         activeProfile = saved,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "订阅已拉取并拆分：${saved.proxies.size} 节点 · ${saved.proxyGroups.size} 策略组"
+                        snackbarMessage = "订阅已拉取入池：${saved.proxies.size} 节点加入节点池 · ${saved.proxyGroups.size} 策略组"
                     )
                 }
             }.onFailure { err ->
@@ -204,7 +225,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     ConfigEngine.refreshSubscriptionNodes(target, freshYaml)
                 }
                 val saved = repository.saveProfile(refreshed)
-                val list = repository.listProfiles()
+                val (list, allLoaded, pool) = loadPoolsSnapshot()
                 val isActive = _uiState.value.activeProfile?.meta?.id == saved.meta.id
                 val compiled = if (isActive) {
                     withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
@@ -214,10 +235,12 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update {
                     it.copy(
                         profiles = list,
+                        allProfiles = allLoaded,
+                        globalNodePool = pool,
                         activeProfile = if (isActive) saved else it.activeProfile,
                         compiledYaml = compiled,
                         isLoading = false,
-                        snackbarMessage = "已仅更新订阅节点，自定义节点、策略组、规则与中转绑定均已保留"
+                        snackbarMessage = "已更新订阅节点并同步至全局节点池，自定义节点、策略组、规则与中转绑定均已保留"
                     )
                 }
             }.onFailure { err ->
@@ -232,9 +255,9 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             runCatching {
                 repository.deleteProfile(profileId)
-                val list = repository.listProfiles()
+                val (list, allLoaded, pool) = loadPoolsSnapshot()
                 val next = if (_uiState.value.activeProfile?.meta?.id == profileId) {
-                    list.firstOrNull()?.let { repository.loadProfile(it.id) }
+                    allLoaded.firstOrNull()
                 } else {
                     _uiState.value.activeProfile
                 }
@@ -244,6 +267,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update {
                     it.copy(
                         profiles = list,
+                        allProfiles = allLoaded,
+                        globalNodePool = pool,
                         activeProfile = next,
                         compiledYaml = compiled,
                         snackbarMessage = "已删除配置"
@@ -251,6 +276,255 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }.onFailure { err ->
                 postMessage("删除失败：${err.message}")
+            }
+        }
+    }
+
+    // --- Global Node Pool & Custom Profile Composer ---
+
+    fun composeCustomProfile(
+        profileName: String,
+        baseProfileId: String,
+        includeBaseGroups: Boolean,
+        includeBaseRules: Boolean,
+        donorGroupMap: Map<String, Set<String>>,
+        donorRuleMap: Map<String, Set<String>>,
+        selectedPoolKeys: Set<String>,
+        autoPopulateGroups: Set<String>
+    ) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val allLoaded = repository.loadAllProfiles()
+                    val byId = allLoaded.associateBy { it.meta.id }
+                    val base = byId[baseProfileId] ?: throw IllegalArgumentException("未找到选中的基底配置")
+
+                    val donorIds = (donorGroupMap.keys + donorRuleMap.keys).filter { it != baseProfileId }
+                    val donors = donorIds.mapNotNull { id ->
+                        val donorProfile = byId[id] ?: return@mapNotNull null
+                        val gSet = donorGroupMap[id].orEmpty()
+                        val rSet = donorRuleMap[id].orEmpty()
+                        if (gSet.isEmpty() && rSet.isEmpty()) null
+                        else DonorSelection(donorProfile, gSet, rSet)
+                    }
+
+                    val pool = withContext(Dispatchers.Default) { ConfigEngine.buildGlobalNodePool(allLoaded) }
+                    val pickedNodes = pool.filter { it.key in selectedPoolKeys }
+                    val composed = withContext(Dispatchers.Default) {
+                        ConfigEngine.composeCustomProfile(
+                            profileName = profileName,
+                            baseProfile = base,
+                            includeBaseGroups = includeBaseGroups,
+                            includeBaseRules = includeBaseRules,
+                            donors = donors,
+                            selectedPoolNodes = pickedNodes,
+                            autoPopulateGroups = autoPopulateGroups
+                        )
+                    }
+                    val saved = repository.saveProfile(composed)
+                    val (list, freshAll, freshPool) = loadPoolsSnapshot()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            allProfiles = freshAll,
+                            globalNodePool = freshPool,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            nodeLatencies = emptyMap(),
+                            isLoading = false,
+                            snackbarMessage = "已撮合生成「${saved.meta.name}」：${saved.proxies.size} 节点 · ${saved.proxyGroups.size} 策略组 · ${saved.rules.size} 规则"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "撮合配置失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun addNodesFromGlobalPool(poolKeys: Set<String>, targetGroups: List<String> = emptyList()) {
+        if (poolKeys.isEmpty()) return
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val active = _uiState.value.activeProfile ?: return@withLock
+                val poolByKey = _uiState.value.globalNodePool.associateBy { it.key }
+                val picked = poolKeys.mapNotNull { poolByKey[it] }
+                if (picked.isEmpty()) return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    var current = active
+                    for (entry in picked.reversed()) {
+                        val nodeWithOrigin = entry.node.copy(
+                            originProfileId = entry.originProfileId,
+                            originProfileName = entry.originProfileName
+                        )
+                        val (updated, _) = withContext(Dispatchers.Default) {
+                            ConfigEngine.copyNodeToProfile(current, nodeWithOrigin, targetGroups)
+                        }
+                        current = updated
+                    }
+                    val saved = repository.saveProfile(current)
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    val groupNote = if (targetGroups.isNotEmpty()) "，并加入 ${targetGroups.size} 个策略组" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已从全局节点池加入 ${picked.size} 个节点$groupNote"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "加入节点失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun mixinFromDonorProfile(
+        donorProfileId: String,
+        selectedGroupNames: Set<String>,
+        selectedRuleIds: Set<String>,
+        autoPopulateWithCurrentNodes: Boolean = false
+    ) {
+        if (selectedGroupNames.isEmpty() && selectedRuleIds.isEmpty()) return
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                val active = _uiState.value.activeProfile ?: return@withLock
+                if (active.meta.id == donorProfileId) return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val donor = repository.loadProfile(donorProfileId)
+                        ?: throw IllegalStateException("来源配置不存在")
+                    val (updated, summary) = withContext(Dispatchers.Default) {
+                        ConfigEngine.mixinFromDonor(
+                            target = active,
+                            donor = donor,
+                            selectedGroupNames = selectedGroupNames,
+                            selectedRuleIds = selectedRuleIds,
+                            autoPopulateWithCurrentNodes = autoPopulateWithCurrentNodes
+                        )
+                    }
+                    val saved = repository.saveProfile(updated)
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
+                    val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    val providerNote = if (summary.addedProviders > 0) "（自动补全 ${summary.addedProviders} 个 RULE-SET）" else ""
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
+                            activeProfile = saved,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = "已从「${donor.meta.name}」混入 ${summary.addedGroups} 个策略组 · ${summary.addedRules} 条规则$providerNote"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "混入失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun syncProfileFromGlobalPool(profileId: String) {
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                _uiState.update { it.copy(isLoading = true) }
+                runCatching {
+                    val allLoaded = repository.loadAllProfiles()
+                    val target = allLoaded.firstOrNull { it.meta.id == profileId }
+                        ?: throw IllegalStateException("配置不存在")
+                    val pool = withContext(Dispatchers.Default) { ConfigEngine.buildGlobalNodePool(allLoaded) }
+                    val (synced, changedCount) = withContext(Dispatchers.Default) {
+                        ConfigEngine.syncNodesFromPool(target, pool)
+                    }
+                    val saved = repository.saveProfile(synced)
+                    val (list, freshAll, freshPool) = loadPoolsSnapshot()
+                    val isActive = _uiState.value.activeProfile?.meta?.id == saved.meta.id
+                    val compiled = if (isActive) {
+                        withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
+                    } else {
+                        _uiState.value.compiledYaml
+                    }
+                    _uiState.update {
+                        it.copy(
+                            profiles = list,
+                            allProfiles = freshAll,
+                            globalNodePool = freshPool,
+                            activeProfile = if (isActive) saved else it.activeProfile,
+                            compiledYaml = compiled,
+                            isLoading = false,
+                            snackbarMessage = if (changedCount > 0) {
+                                "已从全局节点池同步更新 $changedCount 个节点最新参数（中转与策略组已保留）"
+                            } else {
+                                "当前配置的节点已是节点池最新状态"
+                            }
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(isLoading = false, snackbarMessage = "同步节点池失败：${err.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun testPoolNodeLatency(poolKey: String) {
+        val entry = _uiState.value.globalNodePool.firstOrNull { it.key == poolKey } ?: return
+        viewModelScope.launch {
+            _uiState.update { state ->
+                state.copy(poolLatencies = state.poolLatencies + (poolKey to LatencyResult(testing = true)))
+            }
+            val result = NodeNetworkTools.testTcpLatency(entry.node.server, entry.node.port)
+            _uiState.update { state ->
+                state.copy(poolLatencies = state.poolLatencies + (poolKey to result))
+            }
+        }
+    }
+
+    fun testGlobalPoolLatencies(poolKeys: List<String>) {
+        val byKey = _uiState.value.globalNodePool.associateBy { it.key }
+        val targets = poolKeys.mapNotNull { byKey[it] }
+        if (targets.isEmpty()) return
+        viewModelScope.launch {
+            _uiState.update { state ->
+                val marking = targets.associate { it.key to LatencyResult(testing = true) }
+                state.copy(isTestingPoolLatencies = true, poolLatencies = state.poolLatencies + marking)
+            }
+            val semaphore = Semaphore(8)
+            val results = coroutineScope {
+                targets.map { entry ->
+                    async {
+                        semaphore.withPermit {
+                            val res = NodeNetworkTools.testTcpLatency(entry.node.server, entry.node.port)
+                            _uiState.update { state ->
+                                state.copy(poolLatencies = state.poolLatencies + (entry.key to res))
+                            }
+                            res
+                        }
+                    }
+                }.awaitAll()
+            }
+            val okCount = results.count { it.latencyMs != null }
+            _uiState.update {
+                it.copy(
+                    isTestingPoolLatencies = false,
+                    snackbarMessage = "节点池测速完成：$okCount 个可达，${results.size - okCount} 个超时/不可达"
+                )
             }
         }
     }
@@ -286,7 +560,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         ConfigEngine.applyNodeSubscription(profile, sub, rawContent)
                     }
                     val saved = repository.saveProfile(updated)
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) {
                         ConfigEngine.compileConfig(saved)
                     }
@@ -295,6 +569,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -322,7 +598,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         ConfigEngine.applyNodeSubscription(profile, sub, rawContent)
                     }
                     val saved = repository.saveProfile(updated)
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) {
                         ConfigEngine.compileConfig(saved)
                     }
@@ -330,6 +606,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -377,7 +655,7 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 runCatching {
                     val saved = repository.saveProfile(current)
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) {
                         ConfigEngine.compileConfig(saved)
                     }
@@ -385,6 +663,8 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -489,11 +769,13 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                     val updatedNode = ConfigEngine.replaceNodeServerWithIp(target, ip)
                     val updatedProxies = profile.proxies.map { if (it.id == nodeId) updatedNode else it }
                     val saved = repository.saveProfile(profile.copy(proxies = updatedProxies))
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -549,12 +831,14 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                 val skipped = profile.proxies.size - domainNodes.size
                 runCatching {
                     val saved = repository.saveProfile(profile.copy(proxies = updatedProxies))
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
                     val failNote = if (failed > 0) "，$failed 个解析失败" else ""
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -628,13 +912,15 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
 
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(nextActive) }
                     val actionText = if (move) "移动" else "复制"
                     val groupNote = if (targetGroups.isNotEmpty()) "（并加入 ${targetGroups.size} 个策略组）" else ""
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = nextActive,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -675,12 +961,14 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
                         current = updated
                     }
                     val saved = repository.saveProfile(current)
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) { ConfigEngine.compileConfig(saved) }
                     val groupNote = if (targetGroups.isNotEmpty()) "，并加入 ${targetGroups.size} 个策略组" else ""
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             isLoading = false,
@@ -1112,13 +1400,15 @@ class ConfigBoxViewModel(application: Application) : AndroidViewModel(applicatio
             mutationMutex.withLock {
                 runCatching {
                     val saved = repository.saveProfile(updated)
-                    val list = repository.listProfiles()
+                    val (list, allLoaded, pool) = loadPoolsSnapshot()
                     val compiled = withContext(Dispatchers.Default) {
                         ConfigEngine.compileConfig(saved)
                     }
                     _uiState.update {
                         it.copy(
                             profiles = list,
+                            allProfiles = allLoaded,
+                            globalNodePool = pool,
                             activeProfile = saved,
                             compiledYaml = compiled,
                             snackbarMessage = successMsg ?: it.snackbarMessage

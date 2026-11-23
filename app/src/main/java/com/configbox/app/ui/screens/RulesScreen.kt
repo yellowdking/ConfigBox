@@ -23,6 +23,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.MergeType
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -33,6 +34,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -59,6 +61,7 @@ import com.configbox.app.ui.theme.EmeraldActive
 import com.configbox.app.ui.theme.PureWhite
 import com.configbox.app.ui.theme.RoseDanger
 import com.configbox.app.ui.theme.SkyAccent
+import com.configbox.app.ui.theme.SlateInk
 import com.configbox.app.ui.theme.SlateMuted
 
 private val COMMON_RULE_TYPES = listOf(
@@ -88,6 +91,11 @@ fun RulesScreen(
     var searchQuery by remember { mutableStateOf("") }
     var editingRule by remember { mutableStateOf<RuleEntry?>(null) }
     var isAddingNew by remember { mutableStateOf(false) }
+    var showMixinDialog by remember { mutableStateOf(false) }
+
+    val donorProfiles = remember(uiState.allProfiles, active.meta.id) {
+        uiState.allProfiles.filter { it.meta.id != active.meta.id && it.rules.isNotEmpty() }
+    }
 
     val availableTargets = remember(active.proxyGroups) {
         (active.proxyGroups.map { it.name } + listOf("DIRECT", "REJECT")).distinct()
@@ -127,10 +135,29 @@ fun RulesScreen(
             ) {
                 item {
                     val enabledCount = active.rules.count { it.enabled }
-                    Text(
-                        text = "共 ${active.rules.size} 条规则（已启用 $enabledCount 条，按从上到下顺序匹配）",
-                        style = MaterialTheme.typography.labelMedium
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "共 ${active.rules.size} 条规则（启用 $enabledCount 条）",
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (donorProfiles.isNotEmpty()) {
+                            Spacer(Modifier.width(8.dp))
+                            OutlinedButton(
+                                onClick = { showMixinDialog = true },
+                                border = BorderStroke(1.dp, BorderGray),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Outlined.MergeType, null, Modifier.size(15.dp), tint = SkyAccent)
+                                Spacer(Modifier.width(4.dp))
+                                Text("从配置池混入", fontSize = 12.sp, color = SlateInk)
+                            }
+                        }
+                    }
                 }
 
                 items(filteredRules, key = { it.id }) { rule ->
@@ -166,6 +193,24 @@ fun RulesScreen(
         ) {
             Icon(Icons.Outlined.Add, contentDescription = "添加规则")
         }
+    }
+
+    if (showMixinDialog && donorProfiles.isNotEmpty()) {
+        MixinFromPoolDialog(
+            title = "从配置池混入规则",
+            modeGroupsOnly = false,
+            donorProfiles = donorProfiles,
+            onDismiss = { showMixinDialog = false },
+            onConfirm = { donorId, _, ruleIds, _ ->
+                showMixinDialog = false
+                viewModel.mixinFromDonorProfile(
+                    donorProfileId = donorId,
+                    selectedGroupNames = emptySet(),
+                    selectedRuleIds = ruleIds,
+                    autoPopulateWithCurrentNodes = false
+                )
+            }
+        )
     }
 
     editingRule?.let { rule ->
